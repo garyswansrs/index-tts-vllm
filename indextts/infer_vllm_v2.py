@@ -147,8 +147,14 @@ class IndexTTS2:
             is_distributed=False,
         )
         self.s2mel = s2mel.to(self.device)
-        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        # Enable concurrent processing by increasing max_batch_size
+        # The original max_batch_size=1 was the bottleneck preventing concurrency
+        concurrent_batch_size = getattr(self.cfg, 'concurrent_batch_size', 100)  # Default to 100 concurrent requests
+        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=concurrent_batch_size, max_seq_length=8192)
         self.s2mel.eval()
+        # Ensure no gradients are tracked for concurrent inference
+        for param in self.s2mel.parameters():
+            param.requires_grad = False
         print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
@@ -167,6 +173,9 @@ class IndexTTS2:
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
+        # Ensure no gradients are tracked for concurrent inference
+        for param in self.bigvgan.parameters():
+            param.requires_grad = False
         print(">> bigvgan weights restored from:", bigvgan_name)
 
         self.bpe_path = os.path.join(self.model_dir, "bpe.model")  # self.cfg.dataset["bpe_model"]
@@ -466,7 +475,16 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                    # Ensure tensor is detached and cloned to avoid autograd conflicts in concurrent processing
+                    vc_target_input = vc_target.float().detach().clone()
+                    
+                    # Additional safety: ensure no gradients and run in no_grad context
+                    with torch.no_grad():
+                        # Clear any cached gradients that might interfere with concurrent processing
+                        if hasattr(vc_target_input, 'grad') and vc_target_input.grad is not None:
+                            vc_target_input.grad = None
+                        wav = self.bigvgan(vc_target_input).squeeze().unsqueeze(0)
+                    
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
