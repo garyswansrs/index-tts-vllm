@@ -5,8 +5,6 @@
 # IndexTTS-vLLM
 </div>
 
-Working on IndexTTS2 support, coming soon... 0.0
-
 ## Project Introduction
 This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
 
@@ -62,9 +60,16 @@ Requires PyTorch version 2.8.0 (corresponding to vllm 0.10.2). For specific inst
 ### 4. Install dependencies
 ```bash
 pip install -r requirements.txt
+
+pip install pydub
+sudo apt install ffmpeg
 ```
 
 ### 5. Download model weights
+
+hf download garyswansrs/index_tts_2_vllm checkpoints
+
+this is a pre-converted repo, you dont need to do the rest anymore
 
 These are the official weight files. Download them to any local path. Supports IndexTTS-1.5 weights.
 
@@ -82,10 +87,10 @@ bash convert_hf_format.sh /path/to/your/model_dir
 This operation will convert the official model weights to a format compatible with the transformers library, saved in the `vllm` folder under the model weight path, for easy loading by the vllm library.
 
 ### 7. Launch the web UI!
-Modify the `model_dir` in [`webui.py`](webui.py) to your model weight download path, then run:
 
 ```bash
-python webui.py
+
+python webui_with_presets.py
 ```
 
 The first launch might take longer as it needs to compile CUDA kernels for bigvgan.
