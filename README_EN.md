@@ -67,7 +67,7 @@ sudo apt install ffmpeg
 
 ### 5. Download model weights
 
-hf download garyswansrs/index_tts_2_vllm checkpoints
+hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 
 this is a pre-converted repo, you dont need to do the rest anymore
 
