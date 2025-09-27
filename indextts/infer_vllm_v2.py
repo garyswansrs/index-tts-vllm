@@ -256,7 +256,8 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+              verbose=False, max_text_tokens_per_sentence=120, 
+              speaker_preset=None, **generation_kwargs):
         print(">> start inference...")
         start_time = time.perf_counter()
 
@@ -282,45 +283,74 @@ class IndexTTS2:
             emo_alpha = 1.0
             # assert emo_alpha == 1.0
 
-        # 如果参考音频改变了，才需要重新生成, 提升速度
-        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-            audio, sr = librosa.load(spk_audio_prompt)
-            audio = torch.tensor(audio).unsqueeze(0)
-            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+        # Handle speaker preset or audio processing
+        if speaker_preset is not None:
+            # Use speaker preset - load cached embeddings
+            if hasattr(self, 'preset_manager') and self.preset_manager:
+                preset_data = self.preset_manager.get_speaker_preset(speaker_preset)
+                if preset_data:
+                    if verbose:
+                        print(f">> Using speaker preset: {speaker_preset}")
+                    
+                    # Extract cached values directly for this inference
+                    spk_cond_emb = preset_data['spk_cond_emb']
+                    style = preset_data['style']
+                    prompt_condition = preset_data['prompt_condition']
+                    ref_mel = preset_data['ref_mel']
+                    
+                    # For emotion processing, use the same preset data if emo_audio_prompt is None
+                    if emo_audio_prompt is None:
+                        emo_audio_prompt = f"preset:{speaker_preset}"  # Use preset identifier
+                else:
+                    if verbose:
+                        print(f">> Preset '{speaker_preset}' not found, falling back to audio processing")
+                    speaker_preset = None  # Fall back to normal processing
+            else:
+                if verbose:
+                    print(">> No preset manager available, falling back to audio processing")
+                speaker_preset = None  # Fall back to normal processing
+        
+        # Normal audio processing (either no preset specified or preset not found)
+        if speaker_preset is None:
+            # 如果参考音频改变了，才需要重新生成, 提升速度
+            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+                audio, sr = librosa.load(spk_audio_prompt)
+                audio = torch.tensor(audio).unsqueeze(0)
+                audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+                audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
-            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-            input_features = inputs["input_features"]
-            attention_mask = inputs["attention_mask"]
-            input_features = input_features.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            spk_cond_emb = self.get_emb(input_features, attention_mask)
+                inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+                input_features = inputs["input_features"]
+                attention_mask = inputs["attention_mask"]
+                input_features = input_features.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                spk_cond_emb = self.get_emb(input_features, attention_mask)
 
-            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                     num_mel_bins=80,
-                                                     dither=0,
-                                                     sample_frequency=16000)
-            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+                _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+                feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
+                                                         num_mel_bins=80,
+                                                         dither=0,
+                                                         sample_frequency=16000)
+                feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
+                style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
 
-            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                     ylens=ref_target_lengths,
-                                                                     n_quantizers=3,
-                                                                     f0=None)[0]
+                prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                         ylens=ref_target_lengths,
+                                                                         n_quantizers=3,
+                                                                         f0=None)[0]
 
-            self.cache_spk_cond = spk_cond_emb
-            self.cache_s2mel_style = style
-            self.cache_s2mel_prompt = prompt_condition
-            self.cache_spk_audio_prompt = spk_audio_prompt
-            self.cache_mel = ref_mel
-        else:
-            style = self.cache_s2mel_style
-            prompt_condition = self.cache_s2mel_prompt
-            spk_cond_emb = self.cache_spk_cond
-            ref_mel = self.cache_mel
+                self.cache_spk_cond = spk_cond_emb
+                self.cache_s2mel_style = style
+                self.cache_s2mel_prompt = prompt_condition
+                self.cache_spk_audio_prompt = spk_audio_prompt
+                self.cache_mel = ref_mel
+            else:
+                style = self.cache_s2mel_style
+                prompt_condition = self.cache_s2mel_prompt
+                spk_cond_emb = self.cache_spk_cond
+                ref_mel = self.cache_mel
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
@@ -335,19 +365,31 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-            emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
-            self.cache_emo_cond = emo_cond_emb
-            self.cache_emo_audio_prompt = emo_audio_prompt
+        # Handle emotion processing - check if using preset
+        if emo_audio_prompt and emo_audio_prompt.startswith("preset:"):
+            # Using speaker preset for emotion as well
+            if speaker_preset is not None and 'spk_cond_emb' in locals():
+                emo_cond_emb = spk_cond_emb  # Use same embedding as speaker
+                if verbose:
+                    print(f">> Using speaker preset for emotion: {speaker_preset}")
+            else:
+                # Fallback - this shouldn't happen but handle gracefully
+                emo_cond_emb = spk_cond_emb if 'spk_cond_emb' in locals() else None
         else:
-            emo_cond_emb = self.cache_emo_cond
+            # Normal emotion audio processing
+            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
+                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"]
+                emo_attention_mask = emo_inputs["attention_mask"]
+                emo_input_features = emo_input_features.to(self.device)
+                emo_attention_mask = emo_attention_mask.to(self.device)
+                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+
+                self.cache_emo_cond = emo_cond_emb
+                self.cache_emo_audio_prompt = emo_audio_prompt
+            else:
+                emo_cond_emb = self.cache_emo_cond
 
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
