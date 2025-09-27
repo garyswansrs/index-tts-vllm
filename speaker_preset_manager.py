@@ -291,85 +291,18 @@ class SpeakerPresetManager:
         }
 
 
-def integrate_preset_manager_with_tts(tts_model):
+def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets"):
     """
-    Integrate speaker preset manager with existing IndexTTS2 model.
-    This modifies the inference pipeline to use presets when available.
+    Initialize speaker preset manager for IndexTTS2 model.
+    This is thread-safe and doesn't modify the inference pipeline.
+    
+    Args:
+        tts_model: The IndexTTS2 model instance
+        cache_dir: Directory to store speaker presets
+        
+    Returns:
+        SpeakerPresetManager: Initialized preset manager
     """
-    
-    # Create preset manager
-    preset_manager = SpeakerPresetManager(tts_model=tts_model)
-    
-    # Store original infer method
-    original_infer = tts_model.infer
-    
-    async def enhanced_infer(spk_audio_prompt, text, output_path,
-                           preset_name=None,  # NEW: speaker preset name
-                           emo_audio_prompt=None, emo_alpha=1.0,
-                           emo_vector=None,
-                           use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-                           verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
-        
-        # Check if we should use a preset instead of processing audio
-        if preset_name:
-            preset_data = preset_manager.get_speaker_preset(preset_name)
-            if preset_data:
-                if verbose:
-                    print(f">> Using speaker preset: {preset_name}")
-                
-                # Extract cached values (replaces lines 314-318 in original code)
-                spk_cond_emb = preset_data['spk_cond_emb']
-                style = preset_data['style'] 
-                prompt_condition = preset_data['prompt_condition']
-                ref_mel = preset_data['ref_mel']
-                
-                # Set the placeholder values first
-                preset_placeholder = f"preset:{preset_name}"
-                
-                # Update the TTS model's cache to use preset data
-                tts_model.cache_spk_cond = spk_cond_emb
-                tts_model.cache_s2mel_style = style
-                tts_model.cache_s2mel_prompt = prompt_condition
-                tts_model.cache_spk_audio_prompt = preset_placeholder
-                tts_model.cache_mel = ref_mel
-                
-                # CRITICAL: The original code sets emo_audio_prompt = spk_audio_prompt when emo_audio_prompt is None
-                # So we need to set emotion cache to the same values when using speaker preset for emotion
-                # This happens in the original code at lines 280-283 when emo_audio_prompt is None
-                tts_model.cache_emo_cond = spk_cond_emb  # Use same as speaker
-                tts_model.cache_emo_audio_prompt = preset_placeholder  # Must match the placeholder
-                
-                # Set both to the placeholder since we're using preset
-                spk_audio_prompt = preset_placeholder
-                
-                # The original code will set emo_audio_prompt = spk_audio_prompt when it's None (lines 280-283)
-                # So we need to make sure this doesn't happen by setting it explicitly
-                if emo_audio_prompt is None:
-                    emo_audio_prompt = preset_placeholder
-                    
-            else:
-                if verbose:
-                    print(f">> Preset '{preset_name}' not found, falling back to audio processing")
-        
-        # Call original inference method
-        return await original_infer(
-            spk_audio_prompt=spk_audio_prompt,
-            text=text,
-            output_path=output_path,
-            emo_audio_prompt=emo_audio_prompt,
-            emo_alpha=emo_alpha,
-            emo_vector=emo_vector,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text,
-            use_random=use_random,
-            interval_silence=interval_silence,
-            verbose=verbose,
-            max_text_tokens_per_sentence=max_text_tokens_per_sentence,
-            **generation_kwargs
-        )
-    
-    # Replace the infer method
-    tts_model.infer = enhanced_infer
+    preset_manager = SpeakerPresetManager(cache_dir=cache_dir, tts_model=tts_model)
     tts_model.preset_manager = preset_manager
-    
     return preset_manager
