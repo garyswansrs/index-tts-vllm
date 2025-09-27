@@ -52,7 +52,7 @@ from pydub.utils import which
 
 import gradio as gr
 from indextts.infer_vllm_v2 import IndexTTS2
-from speaker_preset_manager import SpeakerPresetManager, integrate_preset_manager_with_tts
+from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
 from text_splitter import split_text
 from tools.i18n.i18n import I18nAuto
 
@@ -169,7 +169,6 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
         if use_preset and preset_name and preset_name != "None":
             output = await tts.infer(
                 spk_audio_prompt="",
-                preset_name=preset_name,
                 text=chunk_text,
                 output_path=output_path,
                 emo_audio_prompt=emo_ref_path,
@@ -180,6 +179,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                 use_random=emo_random,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
                 **kwargs
             )
         else:
@@ -453,7 +453,6 @@ async def gen_single(emo_control_method, prompt, text,
         # Use preset - audio prompt will be ignored
         output = await tts.infer(
             spk_audio_prompt="",  # Not used when preset is specified
-            preset_name=preset_name,  # NEW: Pass preset name
             text=text,
             output_path=output_path,
             emo_audio_prompt=emo_ref_path, 
@@ -464,6 +463,7 @@ async def gen_single(emo_control_method, prompt, text,
             use_random=emo_random,
             verbose=cmd_args.verbose,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+            speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
             **kwargs
         )
     else:
@@ -579,7 +579,7 @@ if __name__ == "__main__":
         print("✅ IndexTTS2 initialized successfully!")
         
         print("🔄 Setting up speaker preset manager...")
-        preset_manager = integrate_preset_manager_with_tts(tts)
+        preset_manager = initialize_preset_manager(tts)
         print("✅ Speaker preset manager initialized!")
         
     except Exception as e:
