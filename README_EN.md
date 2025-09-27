@@ -43,7 +43,7 @@ It basically maintains the performance of the original project.
 
 ### 1. Clone this project
 ```bash
-git clone https://github.com/Ksuriuri/index-tts-vllm.git
+git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
 ```
 
