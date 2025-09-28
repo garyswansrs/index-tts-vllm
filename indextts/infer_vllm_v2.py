@@ -38,6 +38,9 @@ from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 from indextts.s2mel.modules.audio import mel_spectrogram
 
 import torch.nn.functional as F
+import json
+import hashlib
+import os
 
 
 class IndexTTS2:
@@ -217,9 +220,83 @@ class IndexTTS2:
         self.cache_mel = None
 
         self.speaker_dict = {}
+        
+        # Initialize get_emb cache
+        self._init_emb_cache()
+
+    def _init_emb_cache(self):
+        """Initialize the get_emb cache system"""
+        self.emb_cache_dir = "emb_cache"
+        os.makedirs(self.emb_cache_dir, exist_ok=True)
+        self.emb_cache_file = os.path.join(self.emb_cache_dir, "emb_cache.json")
+        
+        # Load existing cache metadata from file
+        self.emb_cache_metadata = {}
+        if os.path.exists(self.emb_cache_file):
+            try:
+                with open(self.emb_cache_file, 'r', encoding='utf-8') as f:
+                    self.emb_cache_metadata = json.load(f)
+                print(f"Loaded emb cache metadata with {len(self.emb_cache_metadata)} entries")
+            except Exception as e:
+                print(f"Failed to load emb cache metadata: {e}")
+                self.emb_cache_metadata = {}
+    
+    def _get_emb_cache_key(self, input_features, attention_mask):
+        """Generate a cache key for the given input features and attention mask"""
+        # Create a hash based on the tensor data
+        features_hash = hashlib.md5(input_features.cpu().numpy().tobytes()).hexdigest()
+        mask_hash = hashlib.md5(attention_mask.cpu().numpy().tobytes()).hexdigest()
+        return f"{features_hash}_{mask_hash}"
+    
+    def _save_emb_cache_metadata(self):
+        """Save the current cache metadata to file"""
+        try:
+            with open(self.emb_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.emb_cache_metadata, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Failed to save emb cache metadata: {e}")
+    
+    def _get_cached_emb(self, cache_key):
+        """Get cached embedding result if available"""
+        if cache_key in self.emb_cache_metadata:
+            tensor_file = os.path.join(self.emb_cache_dir, f"{cache_key}.pt")
+            if os.path.exists(tensor_file):
+                try:
+                    cached_emb = torch.load(tensor_file, map_location=self.device)
+                    return cached_emb
+                except Exception as e:
+                    print(f"Failed to load cached embedding: {e}")
+                    # Remove invalid cache entry
+                    del self.emb_cache_metadata[cache_key]
+                    if os.path.exists(tensor_file):
+                        os.remove(tensor_file)
+        return None
+    
+    def _cache_emb(self, cache_key, emb_result):
+        """Cache the embedding result"""
+        tensor_file = os.path.join(self.emb_cache_dir, f"{cache_key}.pt")
+        try:
+            torch.save(emb_result.cpu(), tensor_file)
+            self.emb_cache_metadata[cache_key] = {
+                'tensor_file': tensor_file,
+                'shape': list(emb_result.shape),
+                'dtype': str(emb_result.dtype)
+            }
+            self._save_emb_cache_metadata()
+        except Exception as e:
+            print(f"Failed to cache embedding: {e}")
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
+        # Check cache first
+        cache_key = self._get_emb_cache_key(input_features, attention_mask)
+        cached_result = self._get_cached_emb(cache_key)
+        if cached_result is not None:
+            print(f"Using cached embedding result")
+            return cached_result.to(self.device)
+        
+        print(f"Computing embedding...")
+        start_time = time.time()
         vq_emb = self.semantic_model(
             input_features=input_features,
             attention_mask=attention_mask,
@@ -227,6 +304,11 @@ class IndexTTS2:
         )
         feat = vq_emb.hidden_states[17]  # (B, T, C)
         feat = (feat - self.semantic_mean) / self.semantic_std
+        
+        # Cache the result
+        self._cache_emb(cache_key, feat)
+        print(f"Embedding computation took {time.time() - start_time:.2f}s")
+        
         return feat
 
     def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
@@ -578,8 +660,9 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, cache_dir="emotion_cache"):
         self.model_dir = model_dir
+        self.cache_dir = cache_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_dir,
@@ -602,6 +685,47 @@ class QwenEmotion:
                             "neutral": 1.0}
         self.max_score = 1.2
         self.min_score = 0.0
+        
+        # Initialize cache
+        self._init_cache()
+
+    def _init_cache(self):
+        """Initialize the emotion cache system"""
+        # Create cache directory if it doesn't exist
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_file = os.path.join(self.cache_dir, "emotion_cache.json")
+        
+        # Load existing cache from file
+        self.emotion_cache = {}
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    self.emotion_cache = json.load(f)
+                print(f"Loaded emotion cache with {len(self.emotion_cache)} entries")
+            except Exception as e:
+                print(f"Failed to load emotion cache: {e}")
+                self.emotion_cache = {}
+    
+    def _save_cache(self):
+        """Save the current cache to file"""
+        try:
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.emotion_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Failed to save emotion cache: {e}")
+    
+    def _get_cached_emotion(self, text_input):
+        """Get cached emotion result if available"""
+        return self.emotion_cache.get(text_input)
+    
+    def _cache_emotion(self, text_input, emotion_dict, content):
+        """Cache the emotion result"""
+        self.emotion_cache[text_input] = {
+            'emotion_dict': emotion_dict,
+            'content': content
+        }
+        # Save to file immediately for persistence
+        self._save_cache()
 
     def convert(self, content):
         content = content.replace("\n", " ")
@@ -645,6 +769,13 @@ class QwenEmotion:
         return emotion_dict
 
     def inference(self, text_input):
+        # Check cache first
+        cached_result = self._get_cached_emotion(text_input)
+        if cached_result is not None:
+            print(f"Using cached emotion result for text: {text_input[:50]}...")
+            return cached_result['emotion_dict'], cached_result['content']
+        
+        print(f"Computing emotion for text: {text_input[:50]}...")
         start = time.time()
         messages = [
             {"role": "system", "content": f"{self.prompt}"},
@@ -675,4 +806,9 @@ class QwenEmotion:
 
         content = self.tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
         emotion_dict = self.convert(content)
+        
+        # Cache the result
+        self._cache_emotion(text_input, emotion_dict, content)
+        print(f"Emotion inference took {time.time() - start:.2f}s")
+        
         return emotion_dict, content
