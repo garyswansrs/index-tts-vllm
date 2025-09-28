@@ -7,6 +7,7 @@
 
 quick start
 
+```bash
 git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
 pip install -r requirements.txt
@@ -15,6 +16,7 @@ pip install flashinfer-python
 pip install flash-attn
 sudo apt install ffmpeg
 python webui_with_presets.py
+```
 
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 ## Project Introduction
