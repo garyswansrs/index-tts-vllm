@@ -148,6 +148,7 @@ class UnifiedVoice(nn.Module):
             top_k=30,  # 5, 30
             repetition_penalty=10.0,  # 8.0
             max_tokens=768,  # 605
+            stop_token_ids=[self.stop_mel_token],  # Stop generation at mel stop token
         )
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
@@ -239,7 +240,10 @@ class UnifiedVoice(nn.Module):
         async for output in output_generator:
             # latent.append(output.hidden_states.clone())
             pass
-        codes = output.outputs[0].token_ids[:-2]
+        codes = output.outputs[0].token_ids
+        # Remove stop token if present (VLLM should stop at stop_token_ids, but let's be safe)
+        if codes and codes[-1] == self.stop_mel_token:
+            codes = codes[:-1]
         codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
 
         return codes, speech_conditioning_latent
