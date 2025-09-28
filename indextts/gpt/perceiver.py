@@ -231,7 +231,7 @@ class PerceiverResampler(nn.Module):
         dim_head=64,
         heads=8,
         ff_mult=4,
-        use_flash_attn=False,
+        use_flash_attn=True,
     ):
         super().__init__()
         dim_context = default(dim_context, dim)
