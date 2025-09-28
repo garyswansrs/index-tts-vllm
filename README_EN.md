@@ -15,10 +15,10 @@ pip install pydub
 pip install flashinfer-python
 pip install flash-attn
 sudo apt install ffmpeg
+hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 python webui_with_presets.py
 ```
 
-hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 ## Project Introduction
 This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
 
