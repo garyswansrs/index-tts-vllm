@@ -5,6 +5,18 @@
 # IndexTTS-vLLM
 </div>
 
+quick start
+
+git clone https://github.com/garyswansrs/index-tts-vllm.git
+cd index-tts-vllm
+pip install -r requirements.txt
+pip install pydub
+pip install flashinfer-python
+pip install flash-attn
+sudo apt install ffmpeg
+python webui_with_presets.py
+
+hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 ## Project Introduction
 This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
 
