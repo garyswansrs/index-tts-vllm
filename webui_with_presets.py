@@ -279,7 +279,8 @@ async def gen_parallel(emo_control_method, prompt, text,
         
         if emo_control_method == 0:
             emo_ref_path = None
-            emo_weight = 1.0
+            # For "same as speaker audio", emo_weight doesn't matter since emo_cond_emb == spk_cond_emb
+            # The merge_emovec result will be the same regardless of alpha value
             vec = None
         elif emo_control_method == 1:
             emo_weight = emo_weight
@@ -434,7 +435,7 @@ async def gen_single(emo_control_method, prompt, text,
         emo_control_method = emo_control_method.value
     if emo_control_method == 0:
         emo_ref_path = None
-        emo_weight = 1.0
+        # For "same as speaker audio", emo_weight doesn't matter since emo_cond_emb == spk_cond_emb
     if emo_control_method == 1:
         emo_weight = emo_weight
     if emo_control_method == 2:
@@ -674,7 +675,10 @@ if __name__ == "__main__":
                 # Emotion reference audio (hidden by default)
                 with gr.Group(visible=False) as emotion_reference_group:
                     emo_upload = gr.Audio(label="Upload Emotion Reference Audio", type="filepath")
-                    emo_weight = gr.Slider(label="Emotion Weight", minimum=0.0, maximum=1.6, value=0.8, step=0.01)
+                
+                # Emotion weight control (available for all methods except "与音色参考音频相同")
+                with gr.Group(visible=False) as emotion_weight_group:
+                    emo_weight = gr.Slider(label="Emotion Weight", minimum=0.0, maximum=1.0, value=0.5, step=0.01)
                 
                 # Emotion random sampling
                 emo_random = gr.Checkbox(label="Random Emotion Sampling", value=False, visible=False)
@@ -804,13 +808,17 @@ if __name__ == "__main__":
         
         def on_method_select(emo_control_method):
             if emo_control_method == 1:
-                return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
+                # emotion_reference_group, emo_random, emotion_weight_group, emotion_vector_group, emo_text_group
+                return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False))
             elif emo_control_method == 2:
-                return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=False))
+                # emotion_reference_group, emo_random, emotion_weight_group, emotion_vector_group, emo_text_group
+                return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=True), gr.update(visible=False))
             elif emo_control_method == 3:
-                return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True))
+                # emotion_reference_group, emo_random, emotion_weight_group, emotion_vector_group, emo_text_group
+                return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True))
             else:
-                return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
+                # emotion_reference_group, emo_random, emotion_weight_group, emotion_vector_group, emo_text_group
+                return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
         
         # Connect event handlers
         use_preset.change(
@@ -822,7 +830,7 @@ if __name__ == "__main__":
         emo_control_method.select(
             on_method_select,
             inputs=[emo_control_method],
-            outputs=[emotion_reference_group, emo_random, emotion_vector_group, emo_text_group]
+            outputs=[emotion_reference_group, emo_random, emotion_weight_group, emotion_vector_group, emo_text_group]
         )
         
         input_text_single.change(
