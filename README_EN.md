@@ -62,6 +62,7 @@ Requires PyTorch version 2.8.0 (corresponding to vllm 0.10.2). For specific inst
 pip install -r requirements.txt
 
 pip install pydub
+pip install flashinfer-python
 sudo apt install ffmpeg
 ```
 
