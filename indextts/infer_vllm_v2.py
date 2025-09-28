@@ -335,7 +335,7 @@ class IndexTTS2:
         return wavs_list
     
     async def infer(self, spk_audio_prompt, text, output_path,
-              emo_audio_prompt=None, emo_alpha=1.0,
+              emo_audio_prompt=None, emo_alpha=0.5,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120, 
@@ -345,9 +345,7 @@ class IndexTTS2:
 
         if use_emo_text:
             emo_audio_prompt = None
-            emo_alpha = 1.0
-            # assert emo_audio_prompt is None
-            # assert emo_alpha == 1.0
+            # Note: emo_alpha is now user-controllable for emotion text control
             if emo_text is None:
                 emo_text = text
             emo_dict, content = self.qwen_emo.inference(emo_text)
@@ -356,14 +354,7 @@ class IndexTTS2:
 
         if emo_vector is not None:
             emo_audio_prompt = None
-            emo_alpha = 1.0
-            # assert emo_audio_prompt is None
-            # assert emo_alpha == 1.0
-
-        if emo_audio_prompt is None:
-            emo_audio_prompt = spk_audio_prompt
-            emo_alpha = 1.0
-            # assert emo_alpha == 1.0
+            # Note: emo_alpha is now user-controllable for emotion vector control
 
         # Handle speaker preset or audio processing
         if speaker_preset is not None:
@@ -383,17 +374,34 @@ class IndexTTS2:
                     # For emotion processing, use the same preset data if emo_audio_prompt is None
                     if emo_audio_prompt is None:
                         emo_audio_prompt = f"preset:{speaker_preset}"  # Use preset identifier
+                    
+                    # Skip normal audio processing since we have preset data
+                    use_preset_data = True
                 else:
                     if verbose:
                         print(f">> Preset '{speaker_preset}' not found, falling back to audio processing")
                     speaker_preset = None  # Fall back to normal processing
+                    use_preset_data = False
             else:
                 if verbose:
                     print(">> No preset manager available, falling back to audio processing")
                 speaker_preset = None  # Fall back to normal processing
+                use_preset_data = False
+        else:
+            use_preset_data = False
+
+        # Set default emotion audio if not using presets and emo_audio_prompt is None
+        if not use_preset_data and emo_audio_prompt is None:
+            # Only use spk_audio_prompt if it's not empty
+            if spk_audio_prompt and spk_audio_prompt.strip():
+                emo_audio_prompt = spk_audio_prompt
+                # Keep user-specified emo_alpha value instead of forcing it to 1.0
+            else:
+                # If spk_audio_prompt is empty, we'll handle this in emotion processing
+                pass
         
         # Normal audio processing (either no preset specified or preset not found)
-        if speaker_preset is None:
+        if not use_preset_data:
             # 如果参考音频改变了，才需要重新生成, 提升速度
             if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
                 audio, sr = librosa.load(spk_audio_prompt)
@@ -448,6 +456,9 @@ class IndexTTS2:
             emovec_mat = emovec_mat.unsqueeze(0)
 
         # Handle emotion processing - check if using preset
+        if verbose:
+            print(f">> DEBUG: emo_audio_prompt = '{emo_audio_prompt}', speaker_preset = '{speaker_preset}', use_preset_data = {use_preset_data}")
+        
         if emo_audio_prompt and emo_audio_prompt.startswith("preset:"):
             # Using speaker preset for emotion as well
             if speaker_preset is not None and 'spk_cond_emb' in locals():
@@ -460,16 +471,25 @@ class IndexTTS2:
         else:
             # Normal emotion audio processing
             if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-                emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
-                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-                emo_input_features = emo_inputs["input_features"]
-                emo_attention_mask = emo_inputs["attention_mask"]
-                emo_input_features = emo_input_features.to(self.device)
-                emo_attention_mask = emo_attention_mask.to(self.device)
-                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+                # Safety check: if emo_audio_prompt is None, empty, or invalid, use speaker embedding
+                if not emo_audio_prompt or emo_audio_prompt.strip() == "":
+                    if 'spk_cond_emb' in locals():
+                        emo_cond_emb = spk_cond_emb
+                        if verbose:
+                            print(">> Using speaker embedding for emotion (same as speaker audio - method 0)")
+                    else:
+                        raise ValueError("No valid emotion audio prompt and no speaker embedding available")
+                else:
+                    emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
+                    emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                    emo_input_features = emo_inputs["input_features"]
+                    emo_attention_mask = emo_inputs["attention_mask"]
+                    emo_input_features = emo_input_features.to(self.device)
+                    emo_attention_mask = emo_attention_mask.to(self.device)
+                    emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
 
-                self.cache_emo_cond = emo_cond_emb
-                self.cache_emo_audio_prompt = emo_audio_prompt
+                    self.cache_emo_cond = emo_cond_emb
+                    self.cache_emo_audio_prompt = emo_audio_prompt
             else:
                 emo_cond_emb = self.cache_emo_cond
 
@@ -502,17 +522,22 @@ class IndexTTS2:
 
             m_start_time = time.perf_counter()
             with torch.no_grad():
-                emovec = self.gpt.merge_emovec(
-                    spk_cond_emb,
-                    emo_cond_emb,
-                    torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                    torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    alpha=emo_alpha
-                )
-
                 if emo_vector is not None:
-                    emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
-                    # emovec = emovec_mat
+                    # For emotion vector control, create base emotion vector from speaker
+                    base_emovec = self.gpt.get_emovec(spk_cond_emb, torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device))
+                    # Apply emotion vectors with weight control
+                    vector_emovec = emovec_mat + (1 - torch.sum(weight_vector)) * base_emovec
+                    # Blend between base emotion and vector-controlled emotion using emo_alpha
+                    emovec = base_emovec + emo_alpha * (vector_emovec - base_emovec)
+                else:
+                    # For emotion reference audio or emotion text control, use merge_emovec
+                    emovec = self.gpt.merge_emovec(
+                        spk_cond_emb,
+                        emo_cond_emb,
+                        torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                        torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        alpha=emo_alpha
+                    )
 
                 codes, speech_conditioning_latent = await self.gpt.inference_speech(
                     spk_cond_emb,
