@@ -63,6 +63,7 @@ pip install -r requirements.txt
 
 pip install pydub
 pip install flashinfer-python
+pip install flash-attn
 sudo apt install ffmpeg
 ```
 
