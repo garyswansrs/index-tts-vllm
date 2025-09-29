@@ -155,7 +155,7 @@ class UnifiedVoice(nn.Module):
             top_p=0.8,
             top_k=30,
             repetition_penalty=10.0,
-            max_tokens=2048,  # Sufficient for most cases, will stop at stop_mel_token
+            max_tokens=2048,  # Sufficient for most cases, will stop at stop_mel_token, and 768 isn't enough for english
             stop_token_ids=[self.stop_mel_token],
             include_stop_str_in_output=True,
         )
