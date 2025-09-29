@@ -21,7 +21,6 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 def null_position_embeddings(range, dim):
     return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
-    
 
 class LearnedPositionEmbeddings(nn.Module):
     def __init__(self, seq_len, model_dim, init=.02):
@@ -142,12 +141,23 @@ class UnifiedVoice(nn.Module):
             module.weight.data.normal_(mean=0.0, std=.02)
 
         self.llm: AsyncLLM = vllm_model
-        self.sampling_params = SamplingParams(
+
+    def _create_sampling_params(self):
+        """
+        Create SamplingParams with sufficient max_tokens for generation.
+        VLLM will automatically stop when stop_mel_token is generated.
+        
+        Returns:
+            SamplingParams: Configured sampling parameters
+        """
+        return SamplingParams(
             temperature=1.0,
             top_p=0.8,
-            top_k=30,  # 5, 30
-            repetition_penalty=10.0,  # 8.0
-            max_tokens=768,  # 605
+            top_k=30,
+            repetition_penalty=10.0,
+            max_tokens=2048,  # Sufficient for most cases, will stop at stop_mel_token
+            stop_token_ids=[self.stop_mel_token],
+            include_stop_str_in_output=True,
         )
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
@@ -230,18 +240,19 @@ class UnifiedVoice(nn.Module):
         mel_start_emb = mel_start_emb + self.mel_pos_embedding(mel_start_emb)
         inputs_embeds = torch.cat([emb, mel_start_emb], dim=1)
 
+        # Create sampling params - VLLM will stop at stop_mel_token automatically
+        sampling_params = self._create_sampling_params()
+        
         fake_inputs = PLACEHOLDER_TOKEN * 1  # [PLACEHOLDER_TOKEN_ID]
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
         tokens_prompt = TokensPrompt(prompt=fake_inputs, multi_modal_data=multi_modal_data)
-        # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
-        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=uuid.uuid4().hex)
-        # latent = []
+        output_generator = self.llm.generate(tokens_prompt, sampling_params=sampling_params, request_id=uuid.uuid4().hex)
+        
         async for output in output_generator:
-            # latent.append(output.hidden_states.clone())
             pass
         codes = output.outputs[0].token_ids[:-2]
         codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
-
+        
         return codes, speech_conditioning_latent
 
     def forward(self, speech_conditioning_latent, text_inputs, text_lengths, mel_codes, mel_codes_lengths, emo_speech_conditioning_latent,
