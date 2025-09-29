@@ -14,7 +14,6 @@ Features:
 """
 
 import os
-import patch_vllm 
 import sys
 import json
 import time
@@ -67,7 +66,7 @@ parser.add_argument("--port", type=int, default=8000, help="Port to run the web 
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web API on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
-parser.add_argument("--gpu_memory_utilization", type=float, default=0.25, help="GPU memory utilization")
+parser.add_argument("--gpu_memory_utilization", type=float, default=0.5, help="GPU memory utilization")
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -1951,4 +1950,5 @@ if __name__ == "__main__":
         h11_max_incomplete_event_size=16777216,  # 16MB for large audio uploads
         access_log=True  # Enable access logging for debugging
     )
+
 
