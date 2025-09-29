@@ -509,7 +509,8 @@ class IndexTTS2:
         s2mel_time = 0
         bigvgan_time = 0
         has_warned = False
-        for sent in sentences:
+        
+        for sent_idx, sent in enumerate(sentences):
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
 
@@ -550,12 +551,6 @@ class IndexTTS2:
                 # print("codes: ", codes)
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
-                    )
                     has_warned = True
 
                 # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
@@ -564,7 +559,6 @@ class IndexTTS2:
                 code_lens = []
                 for code in codes:
                     if self.stop_mel_token not in code:
-                        code_lens.append(len(code))
                         code_len = len(code)
                     else:
                         len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
@@ -580,11 +574,6 @@ class IndexTTS2:
 
                 m_start_time = time.perf_counter()
                 use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
-                # latent = self.gpt(speech_conditioning_latent, text_tokens,
-                #                 torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
-                #                 code_lens*self.gpt.mel_length_compression,
-                #                 cond_mel_lengths=torch.tensor([speech_conditioning_latent.shape[-1]], device=text_tokens.device),
-                #                 return_latent=True, clip_inputs=False)
                 latent = self.gpt(
                     speech_conditioning_latent,
                     text_tokens,
@@ -614,6 +603,7 @@ class IndexTTS2:
                                                                  ylens=target_lengths,
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
+                    # This is where tensor dimension mismatch often happens with mixed content
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
                     vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                    torch.LongTensor([cat_condition.size(1)]).to(
@@ -638,11 +628,12 @@ class IndexTTS2:
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
+                    wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                    if verbose:
+                        print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+                    # wavs.append(wav[:, :-512])
+                    wavs.append(wav.cpu())  # to cpu before saving
+                        
         end_time = time.perf_counter()
 
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
