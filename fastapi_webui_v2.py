@@ -14,6 +14,7 @@ Features:
 """
 
 import os
+import patch_vllm 
 import sys
 import json
 import time
@@ -1950,3 +1951,4 @@ if __name__ == "__main__":
         h11_max_incomplete_event_size=16777216,  # 16MB for large audio uploads
         access_log=True  # Enable access logging for debugging
     )
+
