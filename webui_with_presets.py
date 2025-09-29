@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -71,6 +72,8 @@ os.makedirs("outputs/tasks", exist_ok=True)
 os.makedirs("prompts", exist_ok=True)
 os.makedirs("speaker_presets", exist_ok=True)
 MAX_LENGTH_TO_USE_SPEED = 70
+
+
 # Load example cases
 with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
     example_cases = []
@@ -166,6 +169,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
     try:
         output_path = os.path.join("outputs", f"chunk_{chunk_index}_{int(time.time())}.wav")
         
+        
         if use_preset and preset_name and preset_name != "None":
             output = await tts.infer(
                 spk_audio_prompt="",
@@ -201,6 +205,9 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
         return chunk_index, output
     except Exception as e:
         print(f"❌ Error generating chunk {chunk_index}: {e}")
+        print(f"📝 Chunk text: {chunk_text}")
+        import traceback
+        traceback.print_exc()
         return chunk_index, None
 async def combine_audio_chunks(chunk_results, output_path, sample_rate=22050):
     """Combine multiple audio files into one"""
@@ -448,6 +455,7 @@ async def gen_single(emo_control_method, prompt, text,
         vec = None
     print(f"Emo control mode:{emo_control_method}, vec:{vec}")
     print(f"Using preset: {use_preset}, preset_name: {preset_name}")
+    
     
     # Use preset if specified, otherwise use uploaded audio
     if use_preset and preset_name and preset_name != "None":
