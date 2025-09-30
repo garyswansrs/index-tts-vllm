@@ -26,6 +26,8 @@ class SpeakerPresetManager:
     - Reference mel spectrograms (ref_mel)
     - Speaker styles (style)
     - Prompt conditions (prompt_condition)
+    
+    Optimization: All speaker data is kept in memory (GPU) after first load.
     """
     
     def __init__(self, cache_dir: str = "speaker_presets", tts_model=None):
@@ -34,8 +36,12 @@ class SpeakerPresetManager:
         self.presets_file = self.cache_dir / "presets.json"
         self.tts_model = tts_model
         
-        # Load existing presets
+        # Load existing presets metadata
         self.presets = self._load_presets()
+        
+        # In-memory cache for loaded speaker data (kept on GPU)
+        # This prevents repeated disk I/O and GPU transfers
+        self._memory_cache: Dict[str, Dict[str, torch.Tensor]] = {}
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
@@ -102,6 +108,9 @@ class SpeakerPresetManager:
             if preset_name in self.presets:
                 if self.presets[preset_name].get('audio_hash') == audio_hash:
                     self.logger.info(f"Preset {preset_name} already exists and unchanged")
+                    # Ensure it's loaded in memory cache
+                    if preset_name not in self._memory_cache:
+                        self._load_to_memory(preset_name)
                     return True
             
             # Process audio through the complete speaker pipeline
@@ -110,10 +119,12 @@ class SpeakerPresetManager:
             if processed_data is None:
                 return False
             
-            # Save processed data to cache file
+            # Save CPU version to disk for persistence
+            cpu_data = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
+                       for k, v in processed_data.items()}
             cache_path = self._get_cache_path(preset_name)
             with open(cache_path, 'wb') as f:
-                pickle.dump(processed_data, f)
+                pickle.dump(cpu_data, f)
             
             # Update presets metadata
             self.presets[preset_name] = {
@@ -127,8 +138,11 @@ class SpeakerPresetManager:
             
             self._save_presets()
             
+            # Store GPU version directly in memory cache (processed_data is already on GPU)
+            self._memory_cache[preset_name] = processed_data
+            
             processing_time = time.time() - start_time
-            self.logger.info(f"Speaker preset '{preset_name}' created in {processing_time:.2f}s")
+            self.logger.info(f"Speaker preset '{preset_name}' created and cached in memory in {processing_time:.2f}s")
             return True
             
         except Exception as e:
@@ -176,14 +190,14 @@ class SpeakerPresetManager:
                                                                               n_quantizers=3,
                                                                               f0=None)[0]
             
-            # Return all processed data as CPU tensors for serialization
+            # Return all processed data as GPU tensors (keep on GPU for memory cache)
             return {
-                'spk_cond_emb': spk_cond_emb.cpu(),
-                'S_ref': S_ref.cpu(),
-                'ref_mel': ref_mel.cpu(),
-                'ref_target_lengths': ref_target_lengths.cpu(),
-                'style': style.cpu(),
-                'prompt_condition': prompt_condition.cpu(),
+                'spk_cond_emb': spk_cond_emb,
+                'S_ref': S_ref,
+                'ref_mel': ref_mel,
+                'ref_target_lengths': ref_target_lengths,
+                'style': style,
+                'prompt_condition': prompt_condition,
                 'audio_22k': audio_22k,  # Keep for potential future use
                 'audio_16k': audio_16k   # Keep for potential future use
             }
@@ -192,27 +206,27 @@ class SpeakerPresetManager:
             self.logger.error(f"Failed to process speaker audio: {e}")
             return None
     
-    def get_speaker_preset(self, preset_name: str) -> Optional[Dict[str, torch.Tensor]]:
+    def _load_to_memory(self, preset_name: str) -> bool:
         """
-        Load speaker preset from cache and move tensors to GPU.
+        Load a speaker preset from disk into memory cache.
+        Internal helper method for lazy loading.
         
-        Args:
-            preset_name: Name of the speaker preset
-            
         Returns:
-            Dict containing all processed speaker data, or None if not found
+            bool: True if successful, False otherwise
         """
+        if preset_name in self._memory_cache:
+            return True  # Already in cache
+            
         if preset_name not in self.presets:
-            self.logger.warning(f"Speaker preset '{preset_name}' not found")
-            return None
+            return False
             
         try:
             cache_path = Path(self.presets[preset_name]['cache_file'])
             if not cache_path.exists():
                 self.logger.warning(f"Cache file not found for preset '{preset_name}'")
-                return None
-                
-            # Load cached data
+                return False
+            
+            # Load from disk
             with open(cache_path, 'rb') as f:
                 data = pickle.load(f)
             
@@ -222,23 +236,50 @@ class SpeakerPresetManager:
                     if isinstance(tensor, torch.Tensor):
                         data[key] = tensor.to(self.tts_model.device)
             
-            # Update last used time
-            self.presets[preset_name]['last_used'] = time.time()
-            self._save_presets()
-            
-            self.logger.info(f"Loaded speaker preset: {preset_name}")
-            return data
+            # Store in memory cache
+            self._memory_cache[preset_name] = data
+            self.logger.info(f"Loaded speaker preset '{preset_name}' into memory cache")
+            return True
             
         except Exception as e:
-            self.logger.error(f"Failed to load speaker preset '{preset_name}': {e}")
+            self.logger.error(f"Failed to load preset '{preset_name}' to memory: {e}")
+            return False
+    
+    def get_speaker_preset(self, preset_name: str) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Get speaker preset from memory cache (extremely fast, no disk I/O).
+        Lazy loads from disk if not in memory.
+        
+        Args:
+            preset_name: Name of the speaker preset
+            
+        Returns:
+            Dict containing all processed speaker data (on GPU), or None if not found
+        """
+        if preset_name not in self.presets:
+            self.logger.warning(f"Speaker preset '{preset_name}' not found")
             return None
+        
+        # Check memory cache first (fast path)
+        if preset_name in self._memory_cache:
+            # Update last used time (lightweight operation)
+            self.presets[preset_name]['last_used'] = time.time()
+            return self._memory_cache[preset_name]
+        
+        # Lazy load from disk if not in memory (slow path, happens only once)
+        if self._load_to_memory(preset_name):
+            self.presets[preset_name]['last_used'] = time.time()
+            self._save_presets()  # Save updated timestamp
+            return self._memory_cache[preset_name]
+        
+        return None
     
     def list_presets(self) -> Dict[str, Dict[str, Any]]:
         """Get list of all available speaker presets"""
         return self.presets.copy()
     
     def delete_preset(self, preset_name: str) -> bool:
-        """Delete a speaker preset"""
+        """Delete a speaker preset from disk and memory cache"""
         if preset_name not in self.presets:
             return False
             
@@ -247,6 +288,10 @@ class SpeakerPresetManager:
             cache_path = Path(self.presets[preset_name]['cache_file'])
             if cache_path.exists():
                 cache_path.unlink()
+            
+            # Remove from memory cache
+            if preset_name in self._memory_cache:
+                del self._memory_cache[preset_name]
             
             # Remove from presets
             del self.presets[preset_name]
@@ -286,12 +331,62 @@ class SpeakerPresetManager:
         
         return {
             'total_presets': total_presets,
+            'presets_in_memory': len(self._memory_cache),
             'total_cache_size_mb': total_size / (1024 * 1024),
-            'cache_directory': str(self.cache_dir)
+            'cache_directory': str(self.cache_dir),
+            'memory_cache_hit_rate': f"{len(self._memory_cache)}/{total_presets}" if total_presets > 0 else "0/0"
         }
+    
+    def preload_all_speakers(self) -> Dict[str, bool]:
+        """
+        Preload all speaker presets into memory cache at startup.
+        This eliminates first-time loading delays during inference.
+        
+        Returns:
+            Dict mapping speaker names to load success status
+        """
+        results = {}
+        self.logger.info(f"Preloading {len(self.presets)} speaker presets into memory...")
+        start_time = time.time()
+        
+        for preset_name in self.presets.keys():
+            if preset_name not in self._memory_cache:
+                results[preset_name] = self._load_to_memory(preset_name)
+            else:
+                results[preset_name] = True  # Already loaded
+        
+        successful = sum(1 for v in results.values() if v)
+        elapsed = time.time() - start_time
+        
+        self.logger.info(f"Preloaded {successful}/{len(self.presets)} speaker presets in {elapsed:.2f}s")
+        return results
+    
+    def is_loaded(self, preset_name: str) -> bool:
+        """Check if a speaker preset is currently loaded in memory"""
+        return preset_name in self._memory_cache
+    
+    def unload_speaker(self, preset_name: str) -> bool:
+        """
+        Unload a speaker from memory cache (keeps it on disk).
+        Useful for memory management if you have many speakers.
+        
+        Returns:
+            bool: True if unloaded, False if wasn't loaded
+        """
+        if preset_name in self._memory_cache:
+            del self._memory_cache[preset_name]
+            self.logger.info(f"Unloaded speaker preset '{preset_name}' from memory")
+            return True
+        return False
+    
+    def clear_memory_cache(self):
+        """Clear all speakers from memory cache (keeps them on disk)"""
+        count = len(self._memory_cache)
+        self._memory_cache.clear()
+        self.logger.info(f"Cleared {count} speaker presets from memory cache")
 
 
-def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets"):
+def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets", preload_all: bool = True):
     """
     Initialize speaker preset manager for IndexTTS2 model.
     This is thread-safe and doesn't modify the inference pipeline.
@@ -299,10 +394,16 @@ def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets"):
     Args:
         tts_model: The IndexTTS2 model instance
         cache_dir: Directory to store speaker presets
+        preload_all: If True, preload all speakers into memory at startup (recommended)
         
     Returns:
         SpeakerPresetManager: Initialized preset manager
     """
     preset_manager = SpeakerPresetManager(cache_dir=cache_dir, tts_model=tts_model)
     tts_model.preset_manager = preset_manager
+    
+    # Preload all speakers for zero-latency access
+    if preload_all and len(preset_manager.presets) > 0:
+        preset_manager.preload_all_speakers()
+    
     return preset_manager
