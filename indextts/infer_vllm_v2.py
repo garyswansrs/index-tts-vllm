@@ -591,8 +591,8 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
-                    inference_cfg_rate = 0.7
+                    diffusion_steps = 10
+                    inference_cfg_rate = 0
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
