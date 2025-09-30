@@ -21,6 +21,7 @@ import asyncio
 import tempfile
 import traceback
 import hashlib
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional, Literal
 from contextlib import asynccontextmanager
@@ -66,7 +67,7 @@ parser.add_argument("--port", type=int, default=8000, help="Port to run the web 
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web API on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
-parser.add_argument("--gpu_memory_utilization", type=float, default=0.5, help="GPU memory utilization")
+parser.add_argument("--gpu_memory_utilization", type=float, default=0.25, help="GPU memory utilization")
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -525,7 +526,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                         use_preset, preset_name, max_text_tokens_per_sentence, **kwargs):
     """Generate audio for a single text chunk"""
     try:
-        output_path = os.path.join("outputs", f"chunk_{chunk_index}_{int(time.time())}.wav")
+        output_path = os.path.join("outputs", f"chunk_{chunk_index}_{uuid.uuid4().hex[:12]}.wav")
         
         
         if use_preset and preset_name and preset_name != "None":
@@ -1404,7 +1405,7 @@ async def generate_speech(
         # Check if emotion text is provided and not empty
         use_emotion_text = emotion_text and emotion_text.strip() != ""
         
-        output_path = os.path.join("outputs", f"gen_{int(time.time())}.wav")
+        output_path = os.path.join("outputs", f"gen_{uuid.uuid4().hex}.wav")
         result = await tts.infer(
             spk_audio_prompt=audio_paths[0] if audio_paths else "",
             text=text,
@@ -1455,7 +1456,7 @@ async def generate_speech_speaker(request: Request):
         tts = tts_manager.get_tts()
         
         # Use speaker preset
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+        output_path = os.path.join("outputs", f"spk_{uuid.uuid4().hex}.wav")
         
         # Check if emotion text is provided and not empty
         use_emotion_text = emotion_text and emotion_text.strip() != ""
@@ -1703,7 +1704,7 @@ async def flashtts_speak(req: SpeakRequest):
         tts = tts_manager.get_tts()
         
         # Generate speech
-        output_path = os.path.join("outputs", f"speak_{int(time.time())}.wav")
+        output_path = os.path.join("outputs", f"speak_{uuid.uuid4().hex}.wav")
         
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
@@ -1823,7 +1824,7 @@ async def flashtts_clone_voice(
             tts = tts_manager.get_tts()
             
             # Generate speech using reference audio
-            output_path = os.path.join("outputs", f"clone_{int(time.time())}.wav")
+            output_path = os.path.join("outputs", f"clone_{uuid.uuid4().hex}.wav")
             
             # Check if emotion text is provided and not empty
             use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
@@ -1950,5 +1951,3 @@ if __name__ == "__main__":
         h11_max_incomplete_event_size=16777216,  # 16MB for large audio uploads
         access_log=True  # Enable access logging for debugging
     )
-
-
