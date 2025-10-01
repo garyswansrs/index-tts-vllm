@@ -923,6 +923,9 @@ async def home():
                             <button type="submit" class="btn" id="generateBtn">
                                 🎵 Generate Speech
                             </button>
+                            <button type="button" class="btn btn-danger" onclick="clearOutputs()">
+                                🗑️ Clear All Outputs
+                            </button>
                         </form>
                         
                         <div id="status" class="status"></div>
@@ -978,6 +981,11 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /generate</strong> - Generate with uploaded files</li>
                             <li><strong>POST /generate_speaker</strong> - Generate with speaker preset</li>
+                        </ul>
+                        
+                        <h5>Maintenance</h5>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>POST /api/clear_outputs</strong> - Clear all generated output files</li>
                         </ul>
                         
                         <h4>🔹 FlashTTS Compatible API</h4>
@@ -1185,6 +1193,34 @@ async def home():
                 }
             }
 
+            async function clearOutputs() {
+                if (!confirm('Are you sure you want to clear all generated output files? This action cannot be undone.')) {
+                    return;
+                }
+                
+                try {
+                    showStatus('Clearing outputs...', 'success');
+                    
+                    const response = await fetch('/api/clear_outputs', {
+                        method: 'POST'
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.status === 'success') {
+                        const message = `✅ ${result.message}\n📁 Files deleted: ${result.files_deleted}\n💾 Space freed: ${result.space_freed_mb} MB`;
+                        showStatus(message, 'success');
+                        
+                        // Clear the audio result display
+                        document.getElementById('audioResult').innerHTML = '';
+                    } else {
+                        showStatus(`Error: ${result.message}`, 'error');
+                    }
+                } catch (error) {
+                    showStatus(`Error clearing outputs: ${error.message}`, 'error');
+                }
+            }
+
             // Add Speaker Form
             document.getElementById('addSpeakerForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
@@ -1375,6 +1411,54 @@ async def api_delete_speaker(speaker_name: str):
         return result
     except Exception as e:
         return {"status": "error", "message": f"Failed to delete speaker: {str(e)}"}
+
+@app.post("/api/clear_outputs")
+async def api_clear_outputs():
+    """API: Clear all generated output files"""
+    try:
+        outputs_dir = "outputs"
+        
+        if not os.path.exists(outputs_dir):
+            return {
+                "status": "success",
+                "message": "Outputs directory does not exist",
+                "files_deleted": 0,
+                "space_freed_mb": 0
+            }
+        
+        # Count files and size before deletion
+        files_deleted = 0
+        total_size = 0
+        
+        # Remove all files in outputs directory and subdirectories
+        for root, dirs, files in os.walk(outputs_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                try:
+                    file_size = os.path.getsize(file_path)
+                    os.remove(file_path)
+                    files_deleted += 1
+                    total_size += file_size
+                    print(f"🗑️ Deleted: {file_path}")
+                except Exception as e:
+                    print(f"⚠️ Failed to delete {file_path}: {e}")
+        
+        space_freed_mb = total_size / (1024 * 1024)
+        
+        return {
+            "status": "success",
+            "message": f"Successfully cleared outputs directory",
+            "files_deleted": files_deleted,
+            "space_freed_mb": round(space_freed_mb, 2)
+        }
+        
+    except Exception as e:
+        print(f"❌ Error clearing outputs: {e}")
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": f"Failed to clear outputs: {str(e)}"
+        }
 
 # Speech Generation Endpoints
 @app.post("/generate")
