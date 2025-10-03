@@ -15,30 +15,24 @@ Features:
 
 import os
 import sys
-import json
-import time
 import asyncio
 import tempfile
 import traceback
-import hashlib
 import uuid
 from pathlib import Path
 from typing import List, Dict, Optional, Literal
 from contextlib import asynccontextmanager
 from io import BytesIO
-import re
 import base64
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-import functools
+
 
 # Audio processing
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
-import librosa
-import torchaudio
-import torch
+
 
 # FastAPI and web interface
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends
@@ -52,7 +46,7 @@ sys.path.insert(0, os.path.join(current_dir, "indextts"))
 
 from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
-from text_splitter import split_text
+
 from tools.i18n.i18n import I18nAuto
 
 # Configuration
@@ -833,6 +827,7 @@ async def home():
                     <span class="performance-badge">🎵 MP3 Output</span>
                     <span class="performance-badge">🔌 FlashTTS API</span>
                     <span class="performance-badge">😊 Emotion Text Control</span>
+                    <span class="performance-badge">🌊 Streaming Mode</span>
                 </div>
             </div>
             <div class="content">
@@ -897,6 +892,32 @@ async def home():
                                 <select id="speaker" name="speaker">
                                     <option value="">Select a speaker...</option>
                                 </select>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label style="display: flex; align-items: center; cursor: pointer;">
+                                    <input type="checkbox" id="streamingMode" name="streamingMode" style="width: auto; margin-right: 10px;">
+                                    <span>⚡ Enable Streaming Mode (Play audio as it's generated)</span>
+                                </label>
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    Streaming mode starts playback immediately when the first chunk is ready
+                                </small>
+                            </div>
+                            
+                            <div class="form-group" id="streamingSettings" style="display: none; background: #f8f9fa; padding: 15px; border-radius: 10px; margin-top: 10px;">
+                                <label for="firstChunkSize">⚡ First Chunk Size: <span id="firstChunkSizeValue">40</span> tokens</label>
+                                <input type="range" id="firstChunkSize" name="firstChunkSize" 
+                                       min="20" max="80" step="10" value="40"
+                                       style="width: 100%; margin: 10px 0;"
+                                       oninput="document.getElementById('firstChunkSizeValue').textContent = this.value">
+                                <div style="display: flex; justify-content: space-between; font-size: 0.85em; color: #666;">
+                                    <span>⚡ Faster (20)</span>
+                                    <span>Balanced (40)</span>
+                                    <span>Quality (80)</span>
+                                </div>
+                                <small style="color: #666; margin-top: 10px; display: block;">
+                                    💡 Smaller = faster first response but more chunks. Recommended: 30-50 tokens.
+                                </small>
                             </div>
                             
                             <!-- Emotion Control Section -->
@@ -981,6 +1002,8 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /generate</strong> - Generate with uploaded files</li>
                             <li><strong>POST /generate_speaker</strong> - Generate with speaker preset</li>
+                            <li><strong>POST /generate_stream</strong> - ⚡ Generate with uploaded files (streaming mode)</li>
+                            <li><strong>POST /generate_speaker_stream</strong> - ⚡ Generate with speaker preset (streaming mode)</li>
                         </ul>
                         
                         <h5>Maintenance</h5>
@@ -1265,6 +1288,7 @@ async def home():
                 const speaker = formData.get('speaker');
                 const emotionText = document.getElementById('emotionText').value;
                 const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
+                const streamingMode = document.getElementById('streamingMode').checked;
                 
                 if (!text.trim()) {
                     showStatus('Please enter some text to synthesize.', 'error');
@@ -1273,6 +1297,20 @@ async def home():
                 
                 try {
                     const startTime = performance.now();
+                    
+                    if (streamingMode) {
+                        // Streaming mode
+                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, formData, startTime);
+                    } else {
+                        // Regular mode
+                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, formData, startTime);
+                    }
+                } catch (error) {
+                    showStatus(`Network error: ${error.message}`, 'error');
+                }
+            });
+
+            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, formData, startTime) {
                     let response;
                     
                     if (speaker) {
@@ -1309,7 +1347,7 @@ async def home():
                         
                         document.getElementById('audioResult').innerHTML = `
                             <h3>🎵 Generated Speech (${duration}s)</h3>
-                            <audio controls style="width: 100%; margin: 10px 0;">
+                        <audio controls autoplay style="width: 100%; margin: 10px 0;">
                                 <source src="${audioUrl}" type="audio/mpeg">
                             </audio>
                             <br>
@@ -1325,8 +1363,262 @@ async def home():
                         const error = await response.text();
                         showStatus(`Error: ${error}`, 'error');
                     }
-                } catch (error) {
-                    showStatus(`Network error: ${error.message}`, 'error');
+            }
+
+            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, formData, startTime) {
+                showStatus('⚡ Streaming: Waiting for first chunk...', 'success');
+                
+                // Get first chunk size setting
+                const firstChunkSize = parseInt(document.getElementById('firstChunkSize').value) || 40;
+                
+                let endpoint, requestOptions;
+                
+                if (speaker) {
+                    // Use speaker streaming endpoint
+                    endpoint = '/generate_speaker_stream';
+                    requestOptions = {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            text: text,
+                            speaker: speaker,
+                            emotion_text: emotionText || "",
+                            emotion_weight: emotionWeight,
+                            first_chunk_size: firstChunkSize
+                        })
+                    };
+                } else {
+                    // Use file upload streaming endpoint
+                    endpoint = '/generate_stream';
+                    formData.append('emotion_text', emotionText || "");
+                    formData.append('emotion_weight', emotionWeight.toString());
+                    formData.append('first_chunk_size', firstChunkSize.toString());
+                    requestOptions = {
+                        method: 'POST',
+                        body: formData
+                    };
+                }
+                
+                const response = await fetch(endpoint, requestOptions);
+                
+                if (!response.ok) {
+                    const error = await response.text();
+                    showStatus(`Error: ${error}`, 'error');
+                    return;
+                }
+                
+                const reader = response.body.getReader();
+                const audioChunks = [];
+                let buffer = new Uint8Array();
+                let chunkCount = 0;
+                let firstChunkTime = null;
+                let audioContext = null;
+                let audioSource = null;
+                let nextStartTime = 0;
+                
+                // Create audio context for streaming playback
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                try {
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        
+                        if (done) {
+                            break;
+                        }
+                        
+                        // Append new data to buffer
+                        const newBuffer = new Uint8Array(buffer.length + value.length);
+                        newBuffer.set(buffer);
+                        newBuffer.set(value, buffer.length);
+                        buffer = newBuffer;
+                        
+                        // Try to parse chunks from buffer
+                        while (true) {
+                            // Look for header: CHUNK:idx:size:status\\n
+                            // Find newline character (10 = '\\n' in ASCII)
+                            let headerEnd = -1;
+                            for (let i = 0; i < buffer.length; i++) {
+                                if (buffer[i] === 10) {
+                                    headerEnd = i;
+                                    break;
+                                }
+                            }
+                            
+                            if (headerEnd === -1) break;
+                            
+                            const headerText = new TextDecoder().decode(buffer.slice(0, headerEnd));
+                            
+                            if (headerText.startsWith('ERROR:')) {
+                                showStatus(`Streaming error: ${headerText.substring(6)}`, 'error');
+                                return;
+                            }
+                            
+                            if (!headerText.startsWith('CHUNK:')) break;
+                            
+                            const parts = headerText.split(':');
+                            if (parts.length !== 4) break;
+                            
+                            const chunkIdx = parseInt(parts[1]);
+                            const chunkSize = parseInt(parts[2]);
+                            const isLast = parts[3] === 'LAST';
+                            
+                            // Check if we have the complete chunk
+                            const chunkStart = headerEnd + 1;
+                            const chunkEnd = chunkStart + chunkSize;
+                            
+                            if (buffer.length < chunkEnd) break;
+                            
+                            // Extract chunk data
+                            const chunkData = buffer.slice(chunkStart, chunkEnd);
+                            buffer = buffer.slice(chunkEnd);
+                            
+                            chunkCount++;
+                            
+                        if (firstChunkTime === null) {
+                            firstChunkTime = performance.now();
+                            const ttfb = ((firstChunkTime - startTime) / 1000).toFixed(2);
+                            
+                            // Show first chunk performance prominently
+                            const firstChunkSize = document.getElementById('firstChunkSize').value;
+                            showStatus(`⚡ First chunk ready in ${ttfb}s! (${firstChunkSize} tokens) Playing now...`, 'success');
+                            
+                            // Show real-time performance indicator
+                            document.getElementById('audioResult').innerHTML = `
+                                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 15px; color: white; margin: 10px 0;">
+                                    <h3 style="margin: 0; display: flex; align-items: center; gap: 10px;">
+                                        <span class="loading"></span>
+                                        Streaming in progress...
+                                    </h3>
+                                    <div style="margin-top: 15px; background: rgba(255,255,255,0.2); padding: 15px; border-radius: 10px;">
+                                        <div style="font-size: 1.2em; margin-bottom: 5px;">
+                                            ⚡ First Chunk Generated
+                                        </div>
+                                        <div style="font-size: 2em; font-weight: bold;">
+                                            ${ttfb}s
+                                        </div>
+                                        <div style="font-size: 0.9em; opacity: 0.9; margin-top: 5px;">
+                                            🎵 Audio playing • Receiving chunk ${chunkCount}/${chunkCount}...
+                                        </div>
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            // Update chunk counter during streaming
+                            const currentDisplay = document.getElementById('audioResult').innerHTML;
+                            if (currentDisplay.includes('Streaming in progress')) {
+                                const ttfb = ((firstChunkTime - startTime) / 1000).toFixed(2);
+                                document.getElementById('audioResult').innerHTML = `
+                                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 15px; color: white; margin: 10px 0;">
+                                        <h3 style="margin: 0; display: flex; align-items: center; gap: 10px;">
+                                            <span class="loading"></span>
+                                            Streaming in progress...
+                                        </h3>
+                                        <div style="margin-top: 15px; background: rgba(255,255,255,0.2); padding: 15px; border-radius: 10px;">
+                                            <div style="font-size: 1.2em; margin-bottom: 5px;">
+                                                ⚡ First Chunk Generated
+                                            </div>
+                                            <div style="font-size: 2em; font-weight: bold;">
+                                                ${ttfb}s
+                                            </div>
+                                            <div style="font-size: 0.9em; opacity: 0.9; margin-top: 5px;">
+                                                🎵 Audio playing • Received ${chunkCount} chunks...
+                                            </div>
+                                        </div>
+                                    </div>
+                                `;
+                            }
+                        }
+                            
+                            // Decode and play audio chunk
+                            try {
+                                const audioBlob = new Blob([chunkData], {type: 'audio/mpeg'});
+                                const arrayBuffer = await audioBlob.arrayBuffer();
+                                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                                
+                                // Schedule playback
+                                const source = audioContext.createBufferSource();
+                                source.buffer = audioBuffer;
+                                source.connect(audioContext.destination);
+                                
+                                const currentTime = audioContext.currentTime;
+                                if (nextStartTime < currentTime) {
+                                    nextStartTime = currentTime;
+                                }
+                                
+                                source.start(nextStartTime);
+                                nextStartTime += audioBuffer.duration;
+                                
+                                // Store for later download
+                                audioChunks.push(chunkData);
+                                
+                                showStatus(`⚡ Streaming: Playing chunk ${chunkIdx + 1}...`, 'success');
+                            } catch (decodeError) {
+                                console.error('Error decoding audio chunk:', decodeError);
+                                showStatus(`⚠️ Error decoding chunk ${chunkIdx}: ${decodeError.message}`, 'error');
+                            }
+                            
+                        if (isLast) {
+                            const endTime = performance.now();
+                            const duration = ((endTime - startTime) / 1000).toFixed(2);
+                            const firstChunkDuration = ((firstChunkTime - startTime) / 1000).toFixed(2);
+                            
+                            // Combine all chunks for download
+                            const combinedBlob = new Blob(audioChunks, {type: 'audio/mpeg'});
+                            const audioUrl = URL.createObjectURL(combinedBlob);
+                            
+                            // Calculate performance metrics
+                            const totalGenTime = duration;
+                            const firstChunkPercent = ((firstChunkDuration / totalGenTime) * 100).toFixed(0);
+                            
+                            document.getElementById('audioResult').innerHTML = `
+                                <h3>🎵 Streamed Speech (${chunkCount} chunks)</h3>
+                                <audio controls src="${audioUrl}" style="width: 100%; margin: 10px 0;"></audio>
+                                <br>
+                                <div style="background: #f8f9fa; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                                    <h4 style="margin-top: 0;">⚡ Performance Metrics</h4>
+                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                                        <div style="background: white; padding: 10px; border-radius: 5px; border-left: 4px solid #667eea;">
+                                            <strong style="color: #667eea;">⏱️ First Chunk:</strong><br>
+                                            <span style="font-size: 1.5em; font-weight: bold;">${firstChunkDuration}s</span>
+                                        </div>
+                                        <div style="background: white; padding: 10px; border-radius: 5px; border-left: 4px solid #764ba2;">
+                                            <strong style="color: #764ba2;">🕐 Total Time:</strong><br>
+                                            <span style="font-size: 1.5em; font-weight: bold;">${totalGenTime}s</span>
+                                        </div>
+                                    </div>
+                                    <div style="background: white; padding: 10px; border-radius: 5px;">
+                                        <strong>📊 First Chunk Speed:</strong> ${firstChunkPercent}% of total time<br>
+                                        <div style="background: #e1e5e9; height: 10px; border-radius: 5px; margin-top: 5px; overflow: hidden;">
+                                            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); height: 100%; width: ${firstChunkPercent}%;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <a href="${audioUrl}" download="speech.mp3" class="btn">💾 Download</a>
+                            `;
+                            
+                            let statusMessage = `✅ Streaming complete! First chunk: ${firstChunkDuration}s, Total: ${totalGenTime}s (${chunkCount} chunks)`;
+                            if (emotionText && emotionText.trim()) {
+                                statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
+                            }
+                            showStatus(statusMessage, 'success');
+                            return;
+                        }
+                        }
+                    }
+                } catch (streamError) {
+                    console.error('Streaming error:', streamError);
+                    showStatus(`Network error: ${streamError.message}`, 'error');
+                }
+            }
+
+            // Toggle streaming settings visibility
+            document.getElementById('streamingMode').addEventListener('change', function() {
+                const streamingSettings = document.getElementById('streamingSettings');
+                if (this.checked) {
+                    streamingSettings.style.display = 'block';
+                } else {
+                    streamingSettings.style.display = 'none';
                 }
             });
 
@@ -1578,6 +1870,187 @@ async def generate_speech_speaker(request: Request):
             status_code=500,
             media_type="text/plain; charset=utf-8"
         )
+
+@app.post("/generate_speaker_stream")
+async def generate_speech_speaker_stream(request: Request):
+    """Generate speech using speaker preset with streaming"""
+    from fastapi.responses import StreamingResponse
+    
+    try:
+        data = await request.json()
+        text = data["text"]
+        speaker = data["speaker"]
+        emotion_text = data.get("emotion_text", "")
+        emotion_weight = data.get("emotion_weight", 0.3)
+        first_chunk_size = data.get("first_chunk_size", 40)  # Default: 40 tokens for first chunk
+        
+        print(f"🎭 Streaming request received - Speaker: '{speaker}', Text: '{text[:50]}...'")
+        print(f"⚡ First chunk size: {first_chunk_size} tokens (smaller = faster)")
+        
+        # Simple speaker validation to prevent failures
+        if speaker_api and not speaker_api.speaker_exists(speaker):
+            return Response(
+                content=f"Speaker '{speaker}' not found".encode('utf-8'),
+                status_code=404,
+                media_type="text/plain"
+            )
+        
+        tts = tts_manager.get_tts()
+        
+        # Check if emotion text is provided and not empty
+        use_emotion_text = emotion_text and emotion_text.strip() != ""
+        
+        async def audio_stream_generator():
+            """Generator that yields audio chunks as they are produced"""
+            try:
+                chunk_count = 0
+                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                    spk_audio_prompt="",
+                    text=text,
+                    speaker_preset=speaker,
+                    use_emo_text=use_emotion_text,
+                    emo_text=emotion_text if use_emotion_text else None,
+                    emo_alpha=emotion_weight,
+                    first_chunk_max_tokens=first_chunk_size,
+                    verbose=cmd_args.verbose
+                ):
+                    chunk_count += 1
+                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
+                    
+                    # Convert tensor to WAV bytes
+                    wav_data = wav_cpu.numpy().astype(np.int16)
+                    
+                    # Create WAV file in memory
+                    with BytesIO() as wav_buffer:
+                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
+                        wav_bytes = wav_buffer.getvalue()
+                    
+                    # Convert to MP3 for smaller size
+                    audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
+                    with BytesIO() as mp3_buffer:
+                        audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+                        mp3_bytes = mp3_buffer.getvalue()
+                    
+                    # Yield chunk with metadata header
+                    header = f"CHUNK:{chunk_idx}:{len(mp3_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
+                    yield header + mp3_bytes
+                
+                print(f"✅ Streaming complete: {chunk_count} chunks sent")
+                
+            except Exception as e:
+                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
+                print(f"❌ Streaming error: {e}")
+                traceback.print_exc()
+                yield error_msg
+        
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # Disable proxy buffering
+            }
+        )
+        
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"❌ Error in streaming endpoint: {error_msg}")
+        traceback.print_exc()
+        
+        return Response(
+            content=f"Error: {error_msg}".encode('utf-8'),
+            status_code=500,
+            media_type="text/plain; charset=utf-8"
+        )
+
+@app.post("/generate_stream")
+async def generate_speech_stream(
+    text: str = Form(...),
+    voice_files: List[UploadFile] = File(None),
+    emotion_text: Optional[str] = Form(""),
+    emotion_weight: float = Form(0.3)
+):
+    """Generate speech with uploaded voice files and streaming"""
+    from fastapi.responses import StreamingResponse
+    
+    try:
+        tts = tts_manager.get_tts()
+        
+        # Handle multiple reference voice files
+        audio_paths = []
+        if voice_files:
+            for voice_file in voice_files:
+                if voice_file.filename:
+                    voice_content = await voice_file.read()
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_voice:
+                        tmp_path = tmp_voice.name
+                    await async_write_file(tmp_path, voice_content)
+                    audio_paths.append(tmp_path)
+        
+        # Generate speech with streaming
+        print(f"🎵 Generating streaming speech: {text[:50]}...")
+        
+        # Check if emotion text is provided and not empty
+        use_emotion_text = emotion_text and emotion_text.strip() != ""
+        
+        async def audio_stream_generator():
+            """Generator that yields audio chunks as they are produced"""
+            try:
+                chunk_count = 0
+                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                    spk_audio_prompt=audio_paths[0] if audio_paths else "",
+                    text=text,
+                    use_emo_text=use_emotion_text,
+                    emo_text=emotion_text if use_emotion_text else None,
+                    emo_alpha=emotion_weight,
+                    verbose=cmd_args.verbose
+                ):
+                    chunk_count += 1
+                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
+                    
+                    # Convert tensor to WAV bytes
+                    wav_data = wav_cpu.numpy().astype(np.int16)
+                    
+                    # Create WAV file in memory
+                    with BytesIO() as wav_buffer:
+                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
+                        wav_bytes = wav_buffer.getvalue()
+                    
+                    # Convert to MP3 for smaller size
+                    audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
+                    with BytesIO() as mp3_buffer:
+                        audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+                        mp3_bytes = mp3_buffer.getvalue()
+                    
+                    # Yield chunk with metadata header
+                    header = f"CHUNK:{chunk_idx}:{len(mp3_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
+                    yield header + mp3_bytes
+                
+                print(f"✅ Streaming complete: {chunk_count} chunks sent")
+                
+            except Exception as e:
+                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
+                print(f"❌ Streaming error: {e}")
+                traceback.print_exc()
+                yield error_msg
+            finally:
+                # Cleanup
+                cleanup_tasks = [async_remove_file(path) for path in audio_paths]
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # Disable proxy buffering
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Error in streaming endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # FlashTTS API Helper Functions (matching deploy_vllm_indextts.py exactly)
 async def get_audio_bytes_from_url(url: str) -> bytes:
