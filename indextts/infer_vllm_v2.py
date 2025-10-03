@@ -462,18 +462,21 @@ class IndexTTS2:
                 
         return sent_idx, wav_cpu, sentence_stats
     
-    async def infer(self, spk_audio_prompt, text, output_path,
-              emo_audio_prompt=None, emo_alpha=0.5,
-              emo_vector=None,
-              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=120, 
-              speaker_preset=None, **generation_kwargs):
-        print(">> start inference...")
-        start_time = time.perf_counter()
-
+    async def _prepare_inference(self, spk_audio_prompt, text, emo_audio_prompt, emo_alpha, 
+                                 emo_vector, use_emo_text, emo_text, use_random,
+                                 max_text_tokens_per_sentence, speaker_preset, verbose,
+                                 first_chunk_max_tokens=None):
+        """
+        Shared preparation logic for both infer and infer_stream methods.
+        Returns: (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel, 
+                 emovec_mat, weight_vector, sampling_rate)
+        
+        Args:
+            first_chunk_max_tokens: If provided, splits first chunk with this size for streaming.
+                                   For regular infer, pass None to use normal splitting.
+        """
         if use_emo_text:
             emo_audio_prompt = None
-            # Note: emo_alpha is now user-controllable for emotion text control
             if emo_text is None:
                 emo_text = text
             emo_dict, content = self.qwen_emo.inference(emo_text)
@@ -482,55 +485,40 @@ class IndexTTS2:
 
         if emo_vector is not None:
             emo_audio_prompt = None
-            # Note: emo_alpha is now user-controllable for emotion vector control
 
         # Handle speaker preset or audio processing
+        use_preset_data = False
         if speaker_preset is not None:
-            # Use speaker preset - load cached embeddings
             if hasattr(self, 'preset_manager') and self.preset_manager:
                 preset_data = self.preset_manager.get_speaker_preset(speaker_preset)
                 if preset_data:
                     if verbose:
                         print(f">> Using speaker preset: {speaker_preset}")
                     
-                    # Extract cached values directly for this inference
                     spk_cond_emb = preset_data['spk_cond_emb']
                     style = preset_data['style']
                     prompt_condition = preset_data['prompt_condition']
                     ref_mel = preset_data['ref_mel']
                     
-                    # For emotion processing, use the same preset data if emo_audio_prompt is None
                     if emo_audio_prompt is None:
-                        emo_audio_prompt = f"preset:{speaker_preset}"  # Use preset identifier
+                        emo_audio_prompt = f"preset:{speaker_preset}"
                     
-                    # Skip normal audio processing since we have preset data
                     use_preset_data = True
                 else:
                     if verbose:
                         print(f">> Preset '{speaker_preset}' not found, falling back to audio processing")
-                    speaker_preset = None  # Fall back to normal processing
-                    use_preset_data = False
+                    speaker_preset = None
             else:
                 if verbose:
                     print(">> No preset manager available, falling back to audio processing")
-                speaker_preset = None  # Fall back to normal processing
-                use_preset_data = False
-        else:
-            use_preset_data = False
+                speaker_preset = None
 
-        # Set default emotion audio if not using presets and emo_audio_prompt is None
         if not use_preset_data and emo_audio_prompt is None:
-            # Only use spk_audio_prompt if it's not empty
             if spk_audio_prompt and spk_audio_prompt.strip():
                 emo_audio_prompt = spk_audio_prompt
-                # Keep user-specified emo_alpha value instead of forcing it to 1.0
-            else:
-                # If spk_audio_prompt is empty, we'll handle this in emotion processing
-                pass
         
         # Normal audio processing (either no preset specified or preset not found)
         if not use_preset_data:
-            # 如果参考音频改变了，才需要重新生成, 提升速度
             if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
                 audio, sr = librosa.load(spk_audio_prompt)
                 audio = torch.tensor(audio).unsqueeze(0)
@@ -551,8 +539,8 @@ class IndexTTS2:
                                                          num_mel_bins=80,
                                                          dither=0,
                                                          sample_frequency=16000)
-                feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-                style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = self.campplus_model(feat.unsqueeze(0))
 
                 prompt_condition = self.s2mel.models['length_regulator'](S_ref,
                                                                          ylens=ref_target_lengths,
@@ -570,6 +558,9 @@ class IndexTTS2:
                 spk_cond_emb = self.cache_spk_cond
                 ref_mel = self.cache_mel
 
+        # Handle emotion vector
+        emovec_mat = None
+        weight_vector = None
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
             if use_random:
@@ -583,23 +574,19 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        # Handle emotion processing - check if using preset
+        # Handle emotion processing
         if verbose:
             print(f">> DEBUG: emo_audio_prompt = '{emo_audio_prompt}', speaker_preset = '{speaker_preset}', use_preset_data = {use_preset_data}")
         
         if emo_audio_prompt and emo_audio_prompt.startswith("preset:"):
-            # Using speaker preset for emotion as well
             if speaker_preset is not None and 'spk_cond_emb' in locals():
-                emo_cond_emb = spk_cond_emb  # Use same embedding as speaker
+                emo_cond_emb = spk_cond_emb
                 if verbose:
                     print(f">> Using speaker preset for emotion: {speaker_preset}")
             else:
-                # Fallback - this shouldn't happen but handle gracefully
                 emo_cond_emb = spk_cond_emb if 'spk_cond_emb' in locals() else None
         else:
-            # Normal emotion audio processing
             if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-                # Safety check: if emo_audio_prompt is None, empty, or invalid, use speaker embedding
                 if not emo_audio_prompt or emo_audio_prompt.strip() == "":
                     if 'spk_cond_emb' in locals():
                         emo_cond_emb = spk_cond_emb
@@ -621,23 +608,131 @@ class IndexTTS2:
             else:
                 emo_cond_emb = self.cache_emo_cond
 
+        # Tokenize and split sentences
         text_tokens_list = self.tokenizer.tokenize(text)
-        sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
+        
+        # If first_chunk_max_tokens is provided (streaming mode), optimize first chunk
+        if first_chunk_max_tokens is not None and first_chunk_max_tokens < max_text_tokens_per_sentence:
+            # Split first chunk with smaller size for faster response
+            first_sentences = self.tokenizer.split_sentences(
+                text_tokens_list[:min(len(text_tokens_list), first_chunk_max_tokens * 2)], 
+                first_chunk_max_tokens
+            )
+            
+            # If we have more text, split the rest with normal size
+            remaining_tokens = text_tokens_list[min(len(text_tokens_list), first_chunk_max_tokens * 2):]
+            remaining_sentences = []
+            if remaining_tokens:
+                remaining_sentences = self.tokenizer.split_sentences(remaining_tokens, max_text_tokens_per_sentence)
+            
+            # Combine: prioritize first small chunk, then rest with normal size
+            if first_sentences and remaining_sentences:
+                sentences = [first_sentences[0]] + first_sentences[1:] + remaining_sentences
+            elif first_sentences:
+                sentences = first_sentences
+            else:
+                sentences = remaining_sentences
+            
+            if verbose:
+                print(f">> Streaming mode: First chunk tokens: {len(sentences[0]) if sentences else 0}")
+                print(f">> Streaming mode: Total sentences: {len(sentences)}")
+        else:
+            # Normal sentence splitting
+            sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
+        
         if verbose:
             print("text_tokens_list:", text_tokens_list)
             print("sentences count:", len(sentences))
             print("max_text_tokens_per_sentence:", max_text_tokens_per_sentence)
+            if first_chunk_max_tokens is not None:
+                print("first_chunk_max_tokens:", first_chunk_max_tokens)
             print(*sentences, sep="\n")
 
         sampling_rate = 22050
+        
+        return (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
+                emovec_mat, weight_vector, sampling_rate)
+
+    async def infer_stream(self, spk_audio_prompt, text,
+              emo_audio_prompt=None, emo_alpha=0.5,
+              emo_vector=None,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              verbose=False, max_text_tokens_per_sentence=120,
+              first_chunk_max_tokens=40,  # Smaller size for first chunk for faster response
+              speaker_preset=None, **generation_kwargs):
+        """
+        Streaming inference that yields audio chunks as they are generated.
+        Yields (chunk_index, wav_data, is_last) tuples.
+        
+        Args:
+            first_chunk_max_tokens: Maximum tokens for the first chunk (default: 40).
+                                   Smaller value = faster first response.
+                                   Recommended range: 20-60 tokens.
+        """
+        print(">> start streaming inference...")
+        start_time = time.perf_counter()
+
+        # Use shared preparation logic with first_chunk_max_tokens for optimized splitting
+        (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
+         emovec_mat, weight_vector, sampling_rate) = await self._prepare_inference(
+            spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
+            use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
+            speaker_preset, verbose,
+            first_chunk_max_tokens=first_chunk_max_tokens  # Enable first chunk optimization
+        )
+
+        # Process sentences sequentially for streaming
+        print(f">> Processing {len(sentences)} sentences sequentially for streaming...")
+        total_sentences = len(sentences)
+        
+        for sent_idx, sent in enumerate(sentences):
+            is_last = (sent_idx == total_sentences - 1)
+            
+            # Process the sentence
+            _, wav_cpu, stats = await self._process_sentence(
+                sent, sent_idx, spk_cond_emb, emo_cond_emb,
+                emo_vector, emovec_mat,
+                weight_vector,
+                emo_alpha, use_random, prompt_condition, ref_mel, style, verbose
+            )
+            
+            # Add interval silence if not the last sentence
+            if not is_last and interval_silence > 0:
+                channel_size = wav_cpu.size(0)
+                sil_dur = int(sampling_rate * interval_silence / 1000.0)
+                sil_tensor = torch.zeros(channel_size, sil_dur)
+                wav_cpu = torch.cat([wav_cpu, sil_tensor], dim=1)
+            
+            # Yield the chunk
+            yield (sent_idx, wav_cpu, is_last)
+        
+        end_time = time.perf_counter()
+        print(f">> Total streaming inference time: {end_time - start_time:.2f} seconds")
+
+    async def infer(self, spk_audio_prompt, text, output_path,
+              emo_audio_prompt=None, emo_alpha=0.5,
+              emo_vector=None,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              verbose=False, max_text_tokens_per_sentence=120, 
+              speaker_preset=None, **generation_kwargs):
+        print(">> start inference...")
+        start_time = time.perf_counter()
+
+        # Prepare all inputs using shared logic
+        (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
+         emovec_mat, weight_vector, sampling_rate) = await self._prepare_inference(
+            spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
+            use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
+            speaker_preset, verbose
+        )
 
         # Create tasks for parallel processing of all sentences
         print(f">> Processing {len(sentences)} sentences in parallel...")
         tasks = [
             self._process_sentence(
                 sent, sent_idx, spk_cond_emb, emo_cond_emb,
-                emo_vector, emovec_mat if emo_vector is not None else None,
-                weight_vector if emo_vector is not None else None,
+                emo_vector, emovec_mat,
+                weight_vector,
                 emo_alpha, use_random, prompt_condition, ref_mel, style, verbose
             )
             for sent_idx, sent in enumerate(sentences)
