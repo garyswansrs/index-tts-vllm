@@ -145,26 +145,146 @@ async def async_audio_convert(input_path: str, output_format: str = "mp3", bitra
     return await loop.run_in_executor(executor, convert_audio_format, input_path, output_format, bitrate)
 
 async def async_cut_audio_to_duration(input_path: str, max_duration: float = 10.0):
-    """Async wrapper for cutting audio to specified duration"""
+    """Async wrapper for smart audio cutting at silence intervals"""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _cut_audio_to_duration_sync, input_path, max_duration)
+    return await loop.run_in_executor(executor, _smart_cut_audio_at_silence, input_path, max_duration)
 
-def _cut_audio_to_duration_sync(input_path: str, max_duration: float = 10.0):
-    """Cut audio to specified duration (in seconds)"""
+def _detect_silence_intervals(audio_data, sample_rate, min_silence_duration=0.3, silence_threshold=-40):
+    """
+    Detect silence intervals in audio data.
+    
+    Args:
+        audio_data: Audio samples (mono or stereo)
+        sample_rate: Sample rate in Hz
+        min_silence_duration: Minimum duration of silence in seconds (default: 0.3s)
+        silence_threshold: Silence threshold in dB (default: -40dB)
+    
+    Returns:
+        List of tuples (start_sample, end_sample) for each silence interval
+    """
+    import numpy as np
+    
+    # Convert to mono if stereo
+    if len(audio_data.shape) > 1:
+        audio_mono = np.mean(audio_data, axis=1)
+    else:
+        audio_mono = audio_data
+    
+    # Calculate RMS energy in dB
+    frame_length = int(0.02 * sample_rate)  # 20ms frames
+    hop_length = int(0.01 * sample_rate)    # 10ms hop
+    
+    # Calculate energy for each frame
+    energy_db = []
+    for i in range(0, len(audio_mono) - frame_length, hop_length):
+        frame = audio_mono[i:i + frame_length]
+        rms = np.sqrt(np.mean(frame ** 2))
+        db = 20 * np.log10(rms + 1e-10)  # Add small value to avoid log(0)
+        energy_db.append(db)
+    
+    energy_db = np.array(energy_db)
+    
+    # Find silence regions (below threshold)
+    is_silence = energy_db < silence_threshold
+    
+    # Convert frame indices to sample indices
+    min_silence_frames = int(min_silence_duration * sample_rate / hop_length)
+    
+    # Find continuous silence regions
+    silence_intervals = []
+    in_silence = False
+    silence_start = 0
+    
+    for i, silent in enumerate(is_silence):
+        if silent and not in_silence:
+            # Start of silence
+            in_silence = True
+            silence_start = i
+        elif not silent and in_silence:
+            # End of silence
+            silence_length = i - silence_start
+            if silence_length >= min_silence_frames:
+                # Convert frame indices to sample indices
+                start_sample = silence_start * hop_length
+                end_sample = i * hop_length
+                silence_intervals.append((start_sample, end_sample))
+            in_silence = False
+    
+    # Check last region
+    if in_silence:
+        silence_length = len(is_silence) - silence_start
+        if silence_length >= min_silence_frames:
+            start_sample = silence_start * hop_length
+            end_sample = len(audio_mono)
+            silence_intervals.append((start_sample, end_sample))
+    
+    return silence_intervals
+
+def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
+    """
+    Smart audio cutting that uses silence intervals as natural cut points.
+    Tries to find a segment between 3s and 15s that ends at a silence.
+    
+    Args:
+        input_path: Path to input audio file
+        max_duration: Maximum duration (unused, kept for compatibility)
+    
+    Returns:
+        Path to cut audio file
+    """
     try:
         # Load audio data
         audio_data, sample_rate = sf.read(input_path)
         
-        # Calculate the number of samples for the desired duration
-        max_samples = int(max_duration * sample_rate)
+        total_duration = len(audio_data) / sample_rate
         
-        # If audio is shorter than max_duration, return original path
-        if len(audio_data) <= max_samples:
-            print(f"📏 Audio duration ({len(audio_data)/sample_rate:.1f}s) is within limit ({max_duration}s)")
+        # If audio is shorter than 3 seconds, return original
+        if total_duration < 3.0:
+            print(f"📏 Audio duration ({total_duration:.1f}s) is too short, keeping original")
             return input_path
         
-        # Cut audio to max_duration
-        cut_audio = audio_data[:max_samples]
+        # If audio is between 3s and 15s, return original
+        if total_duration <= 15.0:
+            print(f"📏 Audio duration ({total_duration:.1f}s) is within ideal range (3-15s)")
+            return input_path
+        
+        print(f"🔍 Analyzing audio ({total_duration:.1f}s) for silence intervals...")
+        
+        # Detect silence intervals
+        silence_intervals = _detect_silence_intervals(audio_data, sample_rate)
+        
+        if not silence_intervals:
+            print(f"⚠️ No silence intervals found, cutting at 10 seconds")
+            cut_sample = int(10.0 * sample_rate)
+            cut_audio = audio_data[:cut_sample]
+        else:
+            print(f"✓ Found {len(silence_intervals)} silence intervals")
+            
+            # Find the best cut point
+            best_cut_sample = None
+            
+            for start_silence, end_silence in silence_intervals:
+                # Use the middle of the silence interval as cut point
+                cut_sample = (start_silence + end_silence) // 2
+                cut_duration = cut_sample / sample_rate
+                
+                # Check if this cut point gives us a good duration (3s to 15s)
+                if 3.0 <= cut_duration <= 15.0:
+                    best_cut_sample = cut_sample
+                    print(f"✓ Found ideal cut point at {cut_duration:.1f}s (at silence interval)")
+                    break
+            
+            # If no ideal cut point found, try to get closest to target
+            if best_cut_sample is None:
+                # Find the silence interval closest to 10 seconds
+                target_sample = int(10.0 * sample_rate)
+                closest_silence = min(silence_intervals, 
+                                    key=lambda x: abs((x[0] + x[1]) // 2 - target_sample))
+                best_cut_sample = (closest_silence[0] + closest_silence[1]) // 2
+                cut_duration = best_cut_sample / sample_rate
+                print(f"✓ Using closest silence interval at {cut_duration:.1f}s")
+            
+            cut_audio = audio_data[:best_cut_sample]
         
         # Create output path with _cut suffix
         input_name = os.path.splitext(input_path)[0]
@@ -173,10 +293,9 @@ def _cut_audio_to_duration_sync(input_path: str, max_duration: float = 10.0):
         # Save cut audio
         sf.write(output_path, cut_audio, sample_rate)
         
-        original_duration = len(audio_data) / sample_rate
         cut_duration = len(cut_audio) / sample_rate
         
-        print(f"✂️ Audio cut: {original_duration:.1f}s → {cut_duration:.1f}s (saved to {os.path.basename(output_path)})")
+        print(f"✂️ Smart cut: {total_duration:.1f}s → {cut_duration:.1f}s (saved to {os.path.basename(output_path)})")
         
         # Remove original file and return cut file path
         try:
@@ -969,7 +1088,7 @@ async def home():
                                 <input type="file" id="speakerAudioFiles" name="speakerAudioFiles" accept=".wav,.mp3,.m4a,.flac" multiple required>
                                 <small style="color: #666; margin-top: 5px; display: block;">
                                     Upload multiple audio files for better voice quality<br>
-                                    📏 Audio will be automatically cut to 10 seconds for optimal performance
+                                    ✂️ Audio will be smartly cut at silence intervals (3-15s) for optimal performance
                                 </small>
                             </div>
                             
@@ -990,56 +1109,59 @@ async def home():
                 <div id="api" class="tab-content">
                     <div class="form-section">
                         <h3>📚 API Endpoints</h3>
-                        <h4>🔹 IndexTTS Native API</h4>
+                        
+                        <h4 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px; border-radius: 8px;">🔷 FlashTTS-Compatible API (for external use)</h4>
+                        
+                        <h5>Server Information</h5>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>GET /server_info</strong> - Get server information and available speakers</li>
+                        </ul>
+                        
                         <h5>Speaker Management</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>GET /api/speakers</strong> - List all speakers</li>
-                            <li><strong>POST /api/speakers</strong> - Add new speaker</li>
-                            <li><strong>DELETE /api/speakers/{speaker_name}</strong> - Delete speaker</li>
-                        </ul>
-                        
-                        <h5>Speech Generation</h5>
-                        <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>POST /generate</strong> - Generate with uploaded files</li>
-                            <li><strong>POST /generate_speaker</strong> - Generate with speaker preset</li>
-                            <li><strong>POST /generate_stream</strong> - ⚡ Generate with uploaded files (streaming mode)</li>
-                            <li><strong>POST /generate_speaker_stream</strong> - ⚡ Generate with speaker preset (streaming mode)</li>
-                        </ul>
-                        
-                        <h5>Maintenance</h5>
-                        <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>POST /api/clear_outputs</strong> - Clear all generated output files</li>
-                        </ul>
-                        
-                        <h4>🔹 FlashTTS Compatible API</h4>
-                        <h5>Speaker Management</h5>
-                        <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>GET /audio_roles</strong> - List available speakers</li>
-                            <li><strong>POST /add_speaker</strong> - Add new speaker</li>
+                            <li><strong>GET /audio_roles</strong> - List available speakers (returns: <code>{"success": true, "roles": [...]}</code>)</li>
+                            <li><strong>POST /add_speaker</strong> - Add new speaker (with reference audio)</li>
                             <li><strong>POST /delete_speaker</strong> - Delete speaker</li>
-                            <li><strong>GET /server_info</strong> - Get server information</li>
                         </ul>
                         
-                        <h5>Speech Generation</h5>
+                        <h5>Speech Generation - Non-Streaming</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>POST /speak</strong> - Generate speech using speaker
+                            <li><strong>POST /speak</strong> - Generate speech using registered speaker
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Supports emotion text control via <code>emotion_text</code> and <code>emotion_weight</code> parameters</li>
+                                    <li>Parameters: <code>text</code>, <code>name</code>, <code>response_format</code> (mp3/opus/aac/flac/wav/pcm)</li>
+                                    <li>Supports emotion: <code>emotion_text</code>, <code>emotion_weight</code></li>
                                 </ul>
                             </li>
                             <li><strong>POST /clone_voice</strong> - Clone voice using reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Supports emotion text control via <code>emotion_text</code> and <code>emotion_weight</code> parameters</li>
+                                    <li>Parameters: <code>text</code>, <code>reference_audio</code>, <code>response_format</code></li>
+                                    <li>Supports emotion: <code>emotion_text</code>, <code>emotion_weight</code></li>
                                 </ul>
                             </li>
                         </ul>
                         
-                        <h5>🆕 Emotion Text Control</h5>
+                        <h5>⚡ Speech Generation - Streaming</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>emotion_text</strong> (optional): Emotion description text (e.g., "happy and excited", "sad and melancholic")</li>
-                            <li><strong>emotion_weight</strong> (optional): Emotion strength from 0.0 to 1.0 (default: 0.3)</li>
-                            <li>When <code>emotion_text</code> is provided, the system uses IndexTTS2's advanced emotion text control</li>
-                            <li>Example: <code>{"text": "Hello world", "emotion_text": "cheerful and energetic", "emotion_weight": 0.7}</code></li>
+                            <li><strong>POST /speak_stream</strong> - Generate speech (streaming)
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Same parameters as <code>/speak</code></li>
+                                    <li>Format: <code>CHUNK:{idx}:{size}:{status}\n{audio_bytes}</code></li>
+                                </ul>
+                            </li>
+                            <li><strong>POST /clone_voice_stream</strong> - Clone voice (streaming)
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Same parameters as <code>/clone_voice</code></li>
+                                </ul>
+                            </li>
+                        </ul>
+                        
+                        <hr style="margin: 20px 0; border: none; border-top: 2px solid #f0f0f0;">
+                        
+                        <h4>🆕 Emotion Text Control</h4>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>emotion_text</strong> (optional): Emotion description (e.g., "happy and excited")</li>
+                            <li><strong>emotion_weight</strong> (optional): Strength 0.0-1.0 (default: 0.3)</li>
+                            <li>Example: <code>{"text": "Hello", "name": "speaker1", "emotion_text": "cheerful", "emotion_weight": 0.7}</code></li>
                         </ul>
                     </div>
                 </div>
@@ -1142,15 +1264,15 @@ async def home():
 
             async function loadSpeakers() {
                 try {
-                    const response = await fetch('/api/speakers');
+                    const response = await fetch('/audio_roles');
                     const data = await response.json();
                     const select = document.getElementById('speaker');
                     
                     // Clear existing options except first
                     select.innerHTML = '<option value="">Select a speaker...</option>';
                     
-                    if (data.status === 'success') {
-                        Object.keys(data.speakers).forEach(speaker => {
+                    if (data.success && data.roles) {
+                        data.roles.forEach(speaker => {
                             const option = document.createElement('option');
                             option.value = speaker;
                             option.textContent = speaker;
@@ -1164,20 +1286,20 @@ async def home():
 
             async function loadSpeakerList() {
                 try {
-                    const response = await fetch('/api/speakers');
+                    const response = await fetch('/audio_roles');
                     const data = await response.json();
                     const listDiv = document.getElementById('speakerList');
                     
-                    if (data.status === 'success') {
-                        const speakers = data.speakers;
-                        let html = `<h4>📊 ${data.total_speakers} Speakers Available</h4>`;
+                    if (data.success && data.roles) {
+                        const speakers = data.roles;
+                        let html = `<h4>📊 ${speakers.length} Speakers Available</h4>`;
                         
-                        for (const [name, info] of Object.entries(speakers)) {
+                        for (const name of speakers) {
                             html += `
                                 <div class="speaker-item">
                                     <div class="speaker-info">
                                         <h4>🎭 ${name}</h4>
-                                        <small>📁 ${info.audio_count} files • 💾 ${info.total_size_mb.toFixed(2)} MB</small>
+                                        <small>Speaker preset</small>
                                     </div>
                                     <button class="btn btn-danger" onclick="deleteSpeaker('${name}')">🗑️ Delete</button>
                                 </div>
@@ -1200,14 +1322,18 @@ async def home():
                 }
                 
                 try {
-                    const response = await fetch(`/api/speakers/${speakerName}`, {
-                        method: 'DELETE'
+                    const formData = new FormData();
+                    formData.append('name', speakerName);
+                    
+                    const response = await fetch('/delete_speaker', {
+                        method: 'POST',
+                        body: formData
                     });
                     
                     const result = await response.json();
-                    showStatus(result.message, result.status === 'success' ? 'success' : 'error', 'speakerStatus');
+                    showStatus(result.success ? 'Speaker deleted successfully' : result.error, result.success ? 'success' : 'error', 'speakerStatus');
                     
-                    if (result.status === 'success') {
+                    if (result.success) {
                         loadSpeakerList();
                         loadSpeakers(); // Refresh dropdown
                     }
@@ -1248,31 +1374,35 @@ async def home():
             document.getElementById('addSpeakerForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
                 
-                const formData = new FormData(this);
+                const speakerName = document.getElementById('speakerName').value;
+                const audioFiles = document.getElementById('speakerAudioFiles').files;
+                
+                if (!audioFiles || audioFiles.length === 0) {
+                    showStatus('Please select at least one audio file', 'error', 'speakerStatus');
+                    return;
+                }
                 
                 try {
                     showStatus('Adding speaker...', 'success', 'speakerStatus');
                     
-                    const response = await fetch('/api/speakers', {
+                    const formData = new FormData();
+                    formData.append('name', speakerName);
+                    formData.append('audio_file', audioFiles[0]); // FlashTTS /add_speaker uses single file
+                    
+                    const response = await fetch('/add_speaker', {
                         method: 'POST',
                         body: formData
                     });
                     
                     const result = await response.json();
                     
-                    let displayMessage = result.message;
-                    if (result.status === 'success' && result.info === 'already_exists') {
-                        displayMessage += ` (${result.audio_count} existing audio files)`;
-                    } else if (result.status === 'success' && result.info === 'newly_added') {
-                        displayMessage += ` (${result.audio_count} audio files uploaded)`;
-                    }
-                    
-                    showStatus(displayMessage, result.status === 'success' ? 'success' : 'error', 'speakerStatus');
-                    
-                    if (result.status === 'success') {
+                    if (result.success) {
+                        showStatus(`Speaker "${speakerName}" added successfully!`, 'success', 'speakerStatus');
                         this.reset();
                         loadSpeakerList();
                         loadSpeakers(); // Refresh dropdown
+                    } else {
+                        showStatus(`Error: ${result.error}`, 'error', 'speakerStatus');
                     }
                 } catch (error) {
                     showStatus(`Error adding speaker: ${error.message}`, 'error', 'speakerStatus');
@@ -1312,30 +1442,39 @@ async def home():
 
             async function handleRegularRequest(text, speaker, emotionText, emotionWeight, formData, startTime) {
                     let response;
+                    const voiceFiles = document.getElementById('voice_files').files;
                     
                     if (speaker) {
-                        // Use JSON API for speaker preset with emotion support
+                        // Use FlashTTS /speak endpoint with speaker preset
                         const requestData = {
                             text: text, 
-                            speaker: speaker,
+                            name: speaker,  // FlashTTS uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
-                            emotion_weight: emotionWeight
+                            emotion_weight: emotionWeight,
+                            response_format: "mp3"
                         };
                         
-                        response = await fetch('/generate_speaker', {
+                        response = await fetch('/speak', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify(requestData)
                         });
-                    } else {
-                        // Add emotion parameters to form data for file upload
-                        formData.append('emotion_text', emotionText || "");
-                        formData.append('emotion_weight', emotionWeight.toString());
+                    } else if (voiceFiles && voiceFiles.length > 0) {
+                        // Use FlashTTS /clone_voice endpoint with uploaded voice file
+                        const cloneFormData = new FormData();
+                        cloneFormData.append('text', text);
+                        cloneFormData.append('reference_audio_file', voiceFiles[0]);
+                        cloneFormData.append('emotion_text', emotionText || "");
+                        cloneFormData.append('emotion_weight', emotionWeight.toString());
+                        cloneFormData.append('response_format', 'mp3');
                         
-                        response = await fetch('/generate', {
+                        response = await fetch('/clone_voice', {
                             method: 'POST',
-                            body: formData
+                            body: cloneFormData
                         });
+                    } else {
+                        showStatus('Please select a speaker preset or upload a voice file', 'error');
+                        return;
                     }
                     
                     if (response.ok) {
@@ -1373,30 +1512,38 @@ async def home():
                 
                 let endpoint, requestOptions;
                 
+                const voiceFiles = document.getElementById('voice_files').files;
+                
                 if (speaker) {
-                    // Use speaker streaming endpoint
-                    endpoint = '/generate_speaker_stream';
+                    // Use FlashTTS /speak_stream endpoint with speaker preset
+                    endpoint = '/speak_stream';
                     requestOptions = {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             text: text,
-                            speaker: speaker,
+                            name: speaker,  // FlashTTS uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
-                            first_chunk_size: firstChunkSize
+                            response_format: "mp3"
                         })
                     };
-                } else {
-                    // Use file upload streaming endpoint
-                    endpoint = '/generate_stream';
-                    formData.append('emotion_text', emotionText || "");
-                    formData.append('emotion_weight', emotionWeight.toString());
-                    formData.append('first_chunk_size', firstChunkSize.toString());
+                } else if (voiceFiles && voiceFiles.length > 0) {
+                    // Use FlashTTS /clone_voice_stream endpoint with uploaded voice file
+                    endpoint = '/clone_voice_stream';
+                    const cloneFormData = new FormData();
+                    cloneFormData.append('text', text);
+                    cloneFormData.append('reference_audio_file', voiceFiles[0]);
+                    cloneFormData.append('emotion_text', emotionText || "");
+                    cloneFormData.append('emotion_weight', emotionWeight.toString());
+                    cloneFormData.append('response_format', 'mp3');
                     requestOptions = {
                         method: 'POST',
-                        body: formData
+                        body: cloneFormData
                     };
+                } else {
+                    showStatus('Please select a speaker preset or upload a voice file for streaming', 'error');
+                    return;
                 }
                 
                 const response = await fetch(endpoint, requestOptions);
@@ -1632,78 +1779,9 @@ async def home():
     """
 
 # Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    if tts_manager.is_ready() and speaker_api:
-        speakers_data = await speaker_api.list_speakers()
-        speaker_count = speakers_data.get("total_speakers", 0) if speakers_data["status"] == "success" else 0
-        return {
-            "status": "healthy",
-            "message": "IndexTTS vLLM v2 FastAPI WebUI",
-            "engine": "vLLM v2",
-            "concurrent_capacity": "100",
-            "available_speakers": speaker_count,
-            "chinese_support": "✅ Full Chinese text normalization",
-            "audio_format": "🎵 MP3 (128k) for smaller files",
-            "speaker_presets": "✅ Using SpeakerPresetManager"
-        }
-    else:
-        return {
-            "status": "initializing",
-            "message": "IndexTTS vLLM v2 is starting up..."
-        }
+# Health check removed - use /server_info endpoint instead
 
-# Speaker Management API Endpoints
-@app.get("/api/speakers")
-async def api_list_speakers():
-    """API: List all speakers"""
-    if not speaker_api:
-        return {"status": "error", "message": "Speaker manager not initialized"}
-    return await speaker_api.list_speakers()
-
-@app.post("/api/speakers")
-async def api_add_speaker(
-    speakerName: str = Form(...),
-    speakerAudioFiles: List[UploadFile] = File(...)
-):
-    """API: Add a new speaker"""
-    try:
-        if not speaker_api:
-            return {"status": "error", "message": "Speaker manager not initialized"}
-        
-        if not speakerAudioFiles:
-            return {"status": "error", "message": "No audio files provided"}
-        
-        # Read audio files
-        audio_data = []
-        filenames = []
-        
-        for file in speakerAudioFiles:
-            if file.filename:
-                content = await file.read()
-                audio_data.append(content)
-                filenames.append(file.filename)
-        
-        # Add speaker using SpeakerPresetManager
-        result = await speaker_api.add_speaker(speakerName, audio_data, filenames)
-        return result
-        
-    except Exception as e:
-        return {"status": "error", "message": f"Failed to add speaker: {str(e)}"}
-
-@app.delete("/api/speakers/{speaker_name}")
-async def api_delete_speaker(speaker_name: str):
-    """API: Delete a speaker"""
-    try:
-        if not speaker_api:
-            return {"status": "error", "message": "Speaker manager not initialized"}
-        
-        result = await speaker_api.delete_speaker(speaker_name)
-        return result
-    except Exception as e:
-        return {"status": "error", "message": f"Failed to delete speaker: {str(e)}"}
-
+# Utility endpoints
 @app.post("/api/clear_outputs")
 async def api_clear_outputs():
     """API: Clear all generated output files"""
@@ -1751,306 +1829,6 @@ async def api_clear_outputs():
             "status": "error",
             "message": f"Failed to clear outputs: {str(e)}"
         }
-
-# Speech Generation Endpoints
-@app.post("/generate")
-async def generate_speech(
-    text: str = Form(...),
-    voice_files: List[UploadFile] = File(None),
-    emotion_text: Optional[str] = Form(""),
-    emotion_weight: float = Form(0.3)
-):
-    """Generate speech with uploaded voice files"""
-    try:
-        tts = tts_manager.get_tts()
-        
-        # Handle multiple reference voice files
-        audio_paths = []
-        if voice_files:
-            for voice_file in voice_files:
-                if voice_file.filename:
-                    voice_content = await voice_file.read()
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_voice:
-                        tmp_path = tmp_voice.name
-                    await async_write_file(tmp_path, voice_content)
-                    audio_paths.append(tmp_path)
-        
-        # Generate speech with vLLM v2
-        print(f"🎵 Generating speech: {text[:50]}...")
-        
-        # Check if emotion text is provided and not empty
-        use_emotion_text = emotion_text and emotion_text.strip() != ""
-        
-        output_path = os.path.join("outputs", f"gen_{uuid.uuid4().hex}.wav")
-        result = await tts.infer(
-            spk_audio_prompt=audio_paths[0] if audio_paths else "",
-            text=text,
-            output_path=output_path,
-            use_emo_text=use_emotion_text,
-            emo_text=emotion_text if use_emotion_text else None,
-            emo_alpha=emotion_weight,
-            verbose=cmd_args.verbose
-        )
-        
-        # Convert to MP3 format
-        mp3_path = await async_audio_convert(result, "mp3", "128k")
-        
-        # Cleanup
-        cleanup_tasks = [async_remove_file(path) for path in audio_paths]
-        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        
-        return FileResponse(
-            mp3_path,
-            media_type="audio/mpeg",
-            filename="speech.mp3"
-        )
-        
-    except Exception as e:
-        print(f"❌ Error generating speech: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate_speaker")
-async def generate_speech_speaker(request: Request):
-    """Generate speech using speaker preset"""
-    try:
-        data = await request.json()
-        text = data["text"]
-        speaker = data["speaker"]
-        emotion_text = data.get("emotion_text", "")
-        emotion_weight = data.get("emotion_weight", 0.3)
-        
-        print(f"🎭 Request received - Speaker: '{speaker}', Text: '{text[:50]}...'")
-        
-        # Simple speaker validation to prevent failures
-        if speaker_api and not speaker_api.speaker_exists(speaker):
-            return Response(
-                content=f"Speaker '{speaker}' not found".encode('utf-8'),
-                status_code=404,
-                media_type="text/plain"
-            )
-        
-        tts = tts_manager.get_tts()
-        
-        # Use speaker preset
-        output_path = os.path.join("outputs", f"spk_{uuid.uuid4().hex}.wav")
-        
-        # Check if emotion text is provided and not empty
-        use_emotion_text = emotion_text and emotion_text.strip() != ""
-        
-        result = await tts.infer(
-            spk_audio_prompt="",
-            text=text,
-            output_path=output_path,
-            speaker_preset=speaker,
-            use_emo_text=use_emotion_text,
-            emo_text=emotion_text if use_emotion_text else None,
-            emo_alpha=emotion_weight,
-            verbose=cmd_args.verbose
-        )
-        
-        # Convert to MP3 format
-        mp3_path = await async_audio_convert(result, "mp3", "128k")
-        
-        return FileResponse(
-            mp3_path,
-            media_type="audio/mpeg",
-            filename="speech.mp3"
-        )
-        
-    except Exception as e:
-        import traceback
-        error_msg = str(e)
-        print(f"❌ Error generating speech with speaker '{speaker}': {error_msg}")
-        print(f"🔍 Full traceback:")
-        traceback.print_exc()
-        
-        # Return simple error response matching deploy_vllm_indextts.py format
-        return Response(
-            content=f"Error: {error_msg}".encode('utf-8'),
-            status_code=500,
-            media_type="text/plain; charset=utf-8"
-        )
-
-@app.post("/generate_speaker_stream")
-async def generate_speech_speaker_stream(request: Request):
-    """Generate speech using speaker preset with streaming"""
-    from fastapi.responses import StreamingResponse
-    
-    try:
-        data = await request.json()
-        text = data["text"]
-        speaker = data["speaker"]
-        emotion_text = data.get("emotion_text", "")
-        emotion_weight = data.get("emotion_weight", 0.3)
-        first_chunk_size = data.get("first_chunk_size", 40)  # Default: 40 tokens for first chunk
-        
-        print(f"🎭 Streaming request received - Speaker: '{speaker}', Text: '{text[:50]}...'")
-        print(f"⚡ First chunk size: {first_chunk_size} tokens (smaller = faster)")
-        
-        # Simple speaker validation to prevent failures
-        if speaker_api and not speaker_api.speaker_exists(speaker):
-            return Response(
-                content=f"Speaker '{speaker}' not found".encode('utf-8'),
-                status_code=404,
-                media_type="text/plain"
-            )
-        
-        tts = tts_manager.get_tts()
-        
-        # Check if emotion text is provided and not empty
-        use_emotion_text = emotion_text and emotion_text.strip() != ""
-        
-        async def audio_stream_generator():
-            """Generator that yields audio chunks as they are produced"""
-            try:
-                chunk_count = 0
-                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
-                    spk_audio_prompt="",
-                    text=text,
-                    speaker_preset=speaker,
-                    use_emo_text=use_emotion_text,
-                    emo_text=emotion_text if use_emotion_text else None,
-                    emo_alpha=emotion_weight,
-                    first_chunk_max_tokens=first_chunk_size,
-                    verbose=cmd_args.verbose
-                ):
-                    chunk_count += 1
-                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    
-                    # Convert tensor to WAV bytes
-                    wav_data = wav_cpu.numpy().astype(np.int16)
-                    
-                    # Create WAV file in memory
-                    with BytesIO() as wav_buffer:
-                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-                    
-                    # Convert to MP3 for smaller size
-                    audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
-                    with BytesIO() as mp3_buffer:
-                        audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
-                        mp3_bytes = mp3_buffer.getvalue()
-                    
-                    # Yield chunk with metadata header
-                    header = f"CHUNK:{chunk_idx}:{len(mp3_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
-                    yield header + mp3_bytes
-                
-                print(f"✅ Streaming complete: {chunk_count} chunks sent")
-                
-            except Exception as e:
-                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
-                print(f"❌ Streaming error: {e}")
-                traceback.print_exc()
-                yield error_msg
-        
-        return StreamingResponse(
-            audio_stream_generator(),
-            media_type="application/octet-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # Disable proxy buffering
-            }
-        )
-        
-    except Exception as e:
-        import traceback
-        error_msg = str(e)
-        print(f"❌ Error in streaming endpoint: {error_msg}")
-        traceback.print_exc()
-        
-        return Response(
-            content=f"Error: {error_msg}".encode('utf-8'),
-            status_code=500,
-            media_type="text/plain; charset=utf-8"
-        )
-
-@app.post("/generate_stream")
-async def generate_speech_stream(
-    text: str = Form(...),
-    voice_files: List[UploadFile] = File(None),
-    emotion_text: Optional[str] = Form(""),
-    emotion_weight: float = Form(0.3)
-):
-    """Generate speech with uploaded voice files and streaming"""
-    from fastapi.responses import StreamingResponse
-    
-    try:
-        tts = tts_manager.get_tts()
-        
-        # Handle multiple reference voice files
-        audio_paths = []
-        if voice_files:
-            for voice_file in voice_files:
-                if voice_file.filename:
-                    voice_content = await voice_file.read()
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_voice:
-                        tmp_path = tmp_voice.name
-                    await async_write_file(tmp_path, voice_content)
-                    audio_paths.append(tmp_path)
-        
-        # Generate speech with streaming
-        print(f"🎵 Generating streaming speech: {text[:50]}...")
-        
-        # Check if emotion text is provided and not empty
-        use_emotion_text = emotion_text and emotion_text.strip() != ""
-        
-        async def audio_stream_generator():
-            """Generator that yields audio chunks as they are produced"""
-            try:
-                chunk_count = 0
-                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
-                    spk_audio_prompt=audio_paths[0] if audio_paths else "",
-                    text=text,
-                    use_emo_text=use_emotion_text,
-                    emo_text=emotion_text if use_emotion_text else None,
-                    emo_alpha=emotion_weight,
-                    verbose=cmd_args.verbose
-                ):
-                    chunk_count += 1
-                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    
-                    # Convert tensor to WAV bytes
-                    wav_data = wav_cpu.numpy().astype(np.int16)
-                    
-                    # Create WAV file in memory
-                    with BytesIO() as wav_buffer:
-                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-                    
-                    # Convert to MP3 for smaller size
-                    audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
-                    with BytesIO() as mp3_buffer:
-                        audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
-                        mp3_bytes = mp3_buffer.getvalue()
-                    
-                    # Yield chunk with metadata header
-                    header = f"CHUNK:{chunk_idx}:{len(mp3_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
-                    yield header + mp3_bytes
-                
-                print(f"✅ Streaming complete: {chunk_count} chunks sent")
-                
-            except Exception as e:
-                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
-                print(f"❌ Streaming error: {e}")
-                traceback.print_exc()
-                yield error_msg
-            finally:
-                # Cleanup
-                cleanup_tasks = [async_remove_file(path) for path in audio_paths]
-                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        
-        return StreamingResponse(
-            audio_stream_generator(),
-            media_type="application/octet-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # Disable proxy buffering
-            }
-        )
-        
-    except Exception as e:
-        print(f"❌ Error in streaming endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 # FlashTTS API Helper Functions (matching deploy_vllm_indextts.py exactly)
 async def get_audio_bytes_from_url(url: str) -> bytes:
@@ -2136,14 +1914,14 @@ async def flashtts_add_speaker(
         audio_data = audio_io.read()
         filename = audio_file.filename if audio_file else f"{name}_reference.wav"
         
-        # Save to temporary file and cut to 10 seconds
+        # Save to temporary file and smart cut at silence intervals
         temp_dir = Path("speaker_presets") / "temp"
         temp_dir.mkdir(exist_ok=True)
         temp_path = temp_dir / f"flashtts_{name}_{filename}"
         
         try:
             await async_write_file(str(temp_path), audio_data)
-            # Cut audio to 10 seconds if it exceeds the limit
+            # Smart cut: finds silence intervals and cuts at natural pauses (3-15s)
             cut_temp_path = await async_cut_audio_to_duration(str(temp_path), max_duration=10.0)
             
             # Read the cut audio data
@@ -2476,6 +2254,196 @@ async def flashtts_server_info():
                 "success": False,
                 "error": f"Failed to get server info: {str(e)}"
             }
+        )
+
+@app.post("/speak_stream")
+async def flashtts_speak_stream(req: SpeakRequest):
+    """FlashTTS API: Generate speech using registered speaker with streaming"""
+    from fastapi.responses import StreamingResponse
+    
+    try:
+        print(f"🎭 FlashTTS API Streaming: Speaking with '{req.name}' - '{req.text[:50]}...'")
+        
+        if not req.name:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Speaker name is required"}
+            )
+        
+        # Simple speaker validation to prevent failures
+        if speaker_api and not speaker_api.speaker_exists(req.name):
+            speakers_data = await speaker_api.list_speakers()
+            available_roles = list(speakers_data.get("speakers", {}).keys())
+            error_msg = f"'{req.name}' is not in the list of existing roles: {', '.join(available_roles)}"
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": error_msg}
+            )
+        
+        tts = tts_manager.get_tts()
+        
+        # Check if emotion text is provided and not empty
+        use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
+        
+        async def audio_stream_generator():
+            """Generator that yields audio chunks as they are produced"""
+            try:
+                chunk_count = 0
+                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                    spk_audio_prompt="",
+                    text=req.text,
+                    speaker_preset=req.name,
+                    use_emo_text=use_emotion_text,
+                    emo_text=req.emotion_text if use_emotion_text else None,
+                    emo_alpha=req.emotion_weight,
+                    first_chunk_max_tokens=40,  # Default first chunk size
+                    verbose=cmd_args.verbose
+                ):
+                    chunk_count += 1
+                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
+                    
+                    # Convert tensor to WAV bytes
+                    wav_data = wav_cpu.numpy().astype(np.int16)
+                    
+                    # Create WAV file in memory
+                    with BytesIO() as wav_buffer:
+                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
+                        wav_bytes = wav_buffer.getvalue()
+                    
+                    # Convert to requested format
+                    if req.response_format == "wav":
+                        audio_bytes = wav_bytes
+                    else:
+                        audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
+                        with BytesIO() as audio_buffer:
+                            audio_segment.export(audio_buffer, format=req.response_format, bitrate="128k" if req.response_format == "mp3" else None)
+                            audio_bytes = audio_buffer.getvalue()
+                    
+                    # Yield chunk with metadata header
+                    header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
+                    yield header + audio_bytes
+                
+                print(f"✅ Streaming complete: {chunk_count} chunks sent")
+                
+            except Exception as e:
+                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
+                print(f"❌ Streaming error: {e}")
+                traceback.print_exc()
+                yield error_msg
+        
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # Disable proxy buffering
+            }
+        )
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"Voice synthesis streaming failed: {str(e)}"
+        print(f"❌ FlashTTS API Streaming: {error_msg}")
+        print(f"🔍 Full traceback:")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": error_msg}
+        )
+
+@app.post("/clone_voice_stream")
+async def flashtts_clone_voice_stream(
+    req: CloneRequest = Depends(parse_clone_form),
+    reference_audio_file: Optional[UploadFile] = File(None),
+):
+    """FlashTTS API: Clone voice using reference audio with streaming"""
+    from fastapi.responses import StreamingResponse
+    
+    try:
+        print(f"🎵 FlashTTS API Streaming: Cloning voice - '{req.text[:50]}...'")
+        
+        # Load reference audio (matching deploy_vllm_indextts.py)
+        audio_io = await load_audio_bytes_flashtts(reference_audio_file, req.reference_audio)
+        if audio_io is None:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "No reference audio provided"}
+            )
+        
+        # Save reference audio to temporary file
+        audio_data = audio_io.read()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        await async_write_file(tmp_path, audio_data)
+        
+        tts = tts_manager.get_tts()
+        
+        # Check if emotion text is provided and not empty
+        use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
+        
+        async def audio_stream_generator():
+            """Generator that yields audio chunks as they are produced"""
+            try:
+                chunk_count = 0
+                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                    spk_audio_prompt=tmp_path,
+                    text=req.text,
+                    use_emo_text=use_emotion_text,
+                    emo_text=req.emotion_text if use_emotion_text else None,
+                    emo_alpha=req.emotion_weight,
+                    first_chunk_max_tokens=40,  # Default first chunk size
+                    verbose=cmd_args.verbose
+                ):
+                    chunk_count += 1
+                    print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
+                    
+                    # Convert tensor to WAV bytes
+                    wav_data = wav_cpu.numpy().astype(np.int16)
+                    
+                    # Create WAV file in memory
+                    with BytesIO() as wav_buffer:
+                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
+                        wav_bytes = wav_buffer.getvalue()
+                    
+                    # Convert to requested format
+                    if req.response_format == "wav":
+                        audio_bytes = wav_bytes
+                    else:
+                        audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
+                        with BytesIO() as audio_buffer:
+                            audio_segment.export(audio_buffer, format=req.response_format, bitrate="128k" if req.response_format == "mp3" else None)
+                            audio_bytes = audio_buffer.getvalue()
+                    
+                    # Yield chunk with metadata header
+                    header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
+                    yield header + audio_bytes
+                
+                print(f"✅ Streaming complete: {chunk_count} chunks sent")
+                
+            except Exception as e:
+                error_msg = f"ERROR:{str(e)}\n".encode('utf-8')
+                print(f"❌ Streaming error: {e}")
+                traceback.print_exc()
+                yield error_msg
+            finally:
+                # Cleanup temporary file after streaming is complete
+                await async_remove_file(tmp_path)
+        
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # Disable proxy buffering
+            }
+        )
+                
+    except Exception as e:
+        error_msg = f"Failed to clone voice with streaming: {str(e)}"
+        print(f"❌ FlashTTS API Streaming: {error_msg}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": error_msg}
         )
 
 if __name__ == "__main__":
