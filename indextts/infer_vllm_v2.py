@@ -340,9 +340,6 @@ class IndexTTS2:
         text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
         text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
 
-        if verbose:
-            print(f"[Sentence {sent_idx}] text_tokens shape: {text_tokens.shape}, type: {text_tokens.dtype}")
-
         # Timing stats for this sentence
         sentence_stats = {
             'gpt_gen_time': 0,
@@ -354,14 +351,12 @@ class IndexTTS2:
         m_start_time = time.perf_counter()
         with torch.no_grad():
             if emo_vector is not None:
-                # For emotion vector control, create base emotion vector from speaker
+                # For text-based emotion control, blend emovec_mat with speaker's base emotion
                 base_emovec = self.gpt.get_emovec(spk_cond_emb, torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device))
-                # Apply emotion vectors with weight control
-                vector_emovec = emovec_mat + (1 - torch.sum(weight_vector)) * base_emovec
-                # Blend between base emotion and vector-controlled emotion using emo_alpha
-                emovec = base_emovec + emo_alpha * (vector_emovec - base_emovec)
+                # Apply emo_alpha blending: 0=speaker's natural emotion, 1=full text-based emotion
+                emovec = base_emovec + emo_alpha * (emovec_mat - base_emovec)
             else:
-                # For emotion reference audio or emotion text control, use merge_emovec
+                # For emotion reference audio, use merge_emovec
                 emovec = self.gpt.merge_emovec(
                     spk_cond_emb,
                     emo_cond_emb,
@@ -392,10 +387,6 @@ class IndexTTS2:
             codes = codes[:, :code_len]
             code_lens = torch.LongTensor(code_lens)
             code_lens = code_lens.to(self.device)
-
-            if verbose:
-                print(f"[Sentence {sent_idx}] fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                print(f"[Sentence {sent_idx}] code len: {code_lens}")
 
             m_start_time = time.perf_counter()
             use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
@@ -449,14 +440,10 @@ class IndexTTS2:
                         vc_target_input.grad = None
                     wav = self.bigvgan(vc_target_input).squeeze().unsqueeze(0)
                 
-                if verbose:
-                    print(f"[Sentence {sent_idx}] wav shape: {wav.shape}")
                 sentence_stats['bigvgan_time'] = time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                if verbose:
-                    print(f"[Sentence {sent_idx}] wav shape: {wav.shape}, min: {wav.min()}, max: {wav.max()}")
                 
                 wav_cpu = wav.cpu()  # Move to CPU before returning
                 
@@ -480,7 +467,6 @@ class IndexTTS2:
             if emo_text is None:
                 emo_text = text
             emo_dict, content = self.qwen_emo.inference(emo_text)
-            print(emo_dict)
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
@@ -500,7 +486,8 @@ class IndexTTS2:
                     prompt_condition = preset_data['prompt_condition']
                     ref_mel = preset_data['ref_mel']
                     
-                    if emo_audio_prompt is None:
+                    # Only use preset for emotion if no emotion vector is specified (text-based emotion)
+                    if emo_audio_prompt is None and emo_vector is None:
                         emo_audio_prompt = f"preset:{speaker_preset}"
                     
                     use_preset_data = True
@@ -513,7 +500,8 @@ class IndexTTS2:
                     print(">> No preset manager available, falling back to audio processing")
                 speaker_preset = None
 
-        if not use_preset_data and emo_audio_prompt is None:
+        # Only fallback to speaker audio for emotion if no emotion vector is specified
+        if not use_preset_data and emo_audio_prompt is None and emo_vector is None:
             if spk_audio_prompt and spk_audio_prompt.strip():
                 emo_audio_prompt = spk_audio_prompt
         
@@ -575,9 +563,6 @@ class IndexTTS2:
             emovec_mat = emovec_mat.unsqueeze(0)
 
         # Handle emotion processing
-        if verbose:
-            print(f">> DEBUG: emo_audio_prompt = '{emo_audio_prompt}', speaker_preset = '{speaker_preset}', use_preset_data = {use_preset_data}")
-        
         if emo_audio_prompt and emo_audio_prompt.startswith("preset:"):
             if speaker_preset is not None and 'spk_cond_emb' in locals():
                 emo_cond_emb = spk_cond_emb
@@ -591,7 +576,12 @@ class IndexTTS2:
                     if 'spk_cond_emb' in locals():
                         emo_cond_emb = spk_cond_emb
                         if verbose:
-                            print(">> Using speaker embedding for emotion (same as speaker audio - method 0)")
+                            # Note: emo_cond_emb = spk_cond_emb provides voice characteristics
+                            # Actual emotion comes from emovec_mat when text-based emotion is used
+                            if emo_vector is not None:
+                                print(">> Using speaker voice with text-based emotion control")
+                            else:
+                                print(">> Using speaker embedding for emotion (no emotion override)")
                     else:
                         raise ValueError("No valid emotion audio prompt and no speaker embedding available")
                 else:
@@ -641,17 +631,15 @@ class IndexTTS2:
             sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
         
         if verbose:
-            print("text_tokens_list:", text_tokens_list)
             print("sentences count:", len(sentences))
             print("max_text_tokens_per_sentence:", max_text_tokens_per_sentence)
             if first_chunk_max_tokens is not None:
                 print("first_chunk_max_tokens:", first_chunk_max_tokens)
-            print(*sentences, sep="\n")
 
         sampling_rate = 22050
         
         return (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-                emovec_mat, weight_vector, sampling_rate)
+                emovec_mat, weight_vector, emo_vector, sampling_rate)
 
     async def infer_stream(self, spk_audio_prompt, text,
               emo_audio_prompt=None, emo_alpha=0.5,
@@ -674,7 +662,7 @@ class IndexTTS2:
 
         # Use shared preparation logic with first_chunk_max_tokens for optimized splitting
         (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-         emovec_mat, weight_vector, sampling_rate) = await self._prepare_inference(
+         emovec_mat, weight_vector, emo_vector, sampling_rate) = await self._prepare_inference(
             spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
             use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
             speaker_preset, verbose,
@@ -720,7 +708,7 @@ class IndexTTS2:
 
         # Prepare all inputs using shared logic
         (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-         emovec_mat, weight_vector, sampling_rate) = await self._prepare_inference(
+         emovec_mat, weight_vector, emo_vector, sampling_rate) = await self._prepare_inference(
             spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
             use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
             speaker_preset, verbose
