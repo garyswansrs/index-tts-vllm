@@ -8,6 +8,7 @@
 quick start
 
 ```bash
+conda install -c conda-forge libstdcxx-ng
 git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
 pip install -r requirements.txt
