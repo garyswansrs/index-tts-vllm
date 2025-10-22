@@ -816,7 +816,7 @@ if __name__ == "__main__":
                                     label="Target Duration (ms)",
                                     value=0,
                                     minimum=0,
-                                    maximum=600000,
+                                    maximum=6000000,
                                     step=100,
                                     info="0 = auto duration. Set specific duration for dubbing/timing control."
                                 )
