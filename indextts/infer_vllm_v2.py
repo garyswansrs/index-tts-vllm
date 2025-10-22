@@ -336,7 +336,7 @@ class IndexTTS2:
                                 emo_vector, emovec_mat, weight_vector, emo_alpha, 
                                 use_random, prompt_condition, ref_mel, style,
                                 speech_length=0, text_tokens_list=None,
-                                verbose=False):
+                                diffusion_steps=10, verbose=False):
         """Process a single sentence and return the generated waveform and timing stats
         
         Args:
@@ -413,7 +413,6 @@ class IndexTTS2:
             dtype = None
             with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                 m_start_time = time.perf_counter()
-                diffusion_steps = 10
                 inference_cfg_rate = 0
                 latent = self.s2mel.models['gpt_layer'](latent)
                 S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
@@ -670,12 +669,12 @@ class IndexTTS2:
                 emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list)
 
     async def infer_stream(self, spk_audio_prompt, text,
-              emo_audio_prompt=None, emo_alpha=0.5,
+              emo_audio_prompt=None, emo_alpha=0.6,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120,
               first_chunk_max_tokens=40,  # Smaller size for first chunk for faster response
-              speaker_preset=None, speech_length=0, **generation_kwargs):
+              speaker_preset=None, speech_length=0, diffusion_steps=10, **generation_kwargs):
         """
         Streaming inference that yields audio chunks as they are generated.
         Yields (chunk_index, wav_data, is_last) tuples.
@@ -711,7 +710,7 @@ class IndexTTS2:
                 emo_vector, emovec_mat,
                 weight_vector,
                 emo_alpha, use_random, prompt_condition, ref_mel, style,
-                speech_length, text_tokens_list, verbose
+                speech_length, text_tokens_list, diffusion_steps, verbose
             )
             
             # Add interval silence if not the last sentence
@@ -728,11 +727,11 @@ class IndexTTS2:
         print(f">> Total streaming inference time: {end_time - start_time:.2f} seconds")
 
     async def infer(self, spk_audio_prompt, text, output_path,
-              emo_audio_prompt=None, emo_alpha=0.5,
+              emo_audio_prompt=None, emo_alpha=0.6,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120, 
-              speaker_preset=None, speech_length=0, **generation_kwargs):
+              speaker_preset=None, speech_length=0, diffusion_steps=10, **generation_kwargs):
         print(">> start inference...")
         start_time = time.perf_counter()
 
@@ -752,7 +751,7 @@ class IndexTTS2:
                 emo_vector, emovec_mat,
                 weight_vector,
                 emo_alpha, use_random, prompt_condition, ref_mel, style,
-                speech_length, text_tokens_list, verbose
+                speech_length, text_tokens_list, diffusion_steps, verbose
             )
             for sent_idx, sent in enumerate(sentences)
         ]
