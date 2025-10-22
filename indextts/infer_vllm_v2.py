@@ -6,6 +6,7 @@ from subprocess import CalledProcessError
 import traceback
 from typing import List
 import asyncio
+import uuid
 
 import librosa
 import numpy as np
@@ -26,6 +27,10 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+from vllm import SamplingParams, TokensPrompt
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
+
 from indextts.BigVGAN.models import BigVGAN as Generator
 from indextts.gpt.model_vllm_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
@@ -41,12 +46,11 @@ from indextts.s2mel.modules.audio import mel_spectrogram
 import torch.nn.functional as F
 import json
 import hashlib
-import os
 
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
     ):
         """
         Args:
@@ -55,6 +59,7 @@ class IndexTTS2:
             is_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.10).
         """
         if device is not None:
             self.device = device
@@ -80,9 +85,6 @@ class IndexTTS2:
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
-        from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.v1.engine.async_llm import AsyncLLM
-
         vllm_dir = os.path.join(model_dir, "gpt")
         engine_args = AsyncEngineArgs(
             model=vllm_dir,
@@ -93,7 +95,10 @@ class IndexTTS2:
         )
         indextts_vllm = AsyncLLM.from_engine_args(engine_args)
 
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+        self.qwen_emo = QwenEmotion(
+            os.path.join(self.model_dir, self.cfg.qwen_emo_path),
+            gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+        )
 
         self.gpt = UnifiedVoice(indextts_vllm, **self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
@@ -493,7 +498,7 @@ class IndexTTS2:
             emo_audio_prompt = None
             if emo_text is None:
                 emo_text = text
-            emo_dict, content = self.qwen_emo.inference(emo_text)
+            emo_dict, content = await self.qwen_emo.inference(emo_text)
             emo_vector = list(emo_dict.values())
 
         if emo_vector is not None:
@@ -818,16 +823,20 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir, cache_dir="emotion_cache"):
+    def __init__(self, model_dir, gpu_memory_utilization=0.1, cache_dir="emotion_cache"):
         self.model_dir = model_dir
         self.cache_dir = cache_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_dir,
-            torch_dtype="float16",  # "auto"
-            # device_map="auto"
+
+        engine_args = AsyncEngineArgs(
+            model=model_dir,
+            tensor_parallel_size=1,
+            dtype="auto",
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=2048,
         )
-        self.model = self.model.to("cuda")
+        self.model = AsyncLLM.from_engine_args(engine_args)
+
         self.prompt = "文本情感分类"
         self.convert_dict = {
             "愤怒": "angry",
@@ -926,7 +935,7 @@ class QwenEmotion:
 
         return emotion_dict
 
-    def inference(self, text_input):
+    async def inference(self, text_input):
         # Check cache first
         cached_result = self._get_cached_emotion(text_input)
         if cached_result is not None:
@@ -945,15 +954,18 @@ class QwenEmotion:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer(text)["input_ids"]
 
-        # conduct text completion
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=32768,
-            pad_token_id=self.tokenizer.eos_token_id
+        sampling_params = SamplingParams(
+            max_tokens=2048,  # 32768
+            stop_token_ids=[self.tokenizer.eos_token_id],
+            include_stop_str_in_output=True,
         )
-        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        tokens_prompt = TokensPrompt(prompt_token_ids=model_inputs)
+        output_generator = self.model.generate(tokens_prompt, sampling_params=sampling_params, request_id=uuid.uuid4().hex)
+        async for output in output_generator:
+            pass
+        output_ids = output.outputs[0].token_ids[:-2]
 
         # parsing thinking content
         try:
