@@ -221,7 +221,7 @@ def convert_audio_format(input_path, output_format="mp3", bitrate="128k"):
 
 async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt, 
                         emo_ref_path, emo_weight, vec, emo_text, emo_random,
-                        use_preset, preset_name, max_text_tokens_per_sentence, speech_length=0, **kwargs):
+                        use_preset, preset_name, max_text_tokens_per_sentence, speech_length=0, diffusion_steps=10, **kwargs):
     """Generate audio for a single text chunk"""
     try:
         output_path = os.path.join("outputs", f"chunk_{chunk_index}_{int(time.time())}.wav")
@@ -242,6 +242,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                 speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
                 speech_length=speech_length,
+                diffusion_steps=diffusion_steps,
                 **kwargs
             )
         else:
@@ -258,6 +259,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                 speech_length=speech_length,
+                diffusion_steps=diffusion_steps,
                 **kwargs
             )
         
@@ -315,12 +317,13 @@ async def gen_parallel(emo_control_method, prompt, text,
                       emo_text, emo_random,
                       max_text_tokens_per_sentence=120,
                       use_preset=False, preset_name="",
-                      max_parallel_chunks=5,  # NEW: limit parallel processing
-                      chunk_length_zh=100,   # NEW: chunk length for Chinese
-                      chunk_length_en=200,   # NEW: chunk length for English
-                      output_format="mp3",  # NEW: output format
-                      speech_length=0,  # NEW: target duration control
-                      *args, progress=gr.Progress()):
+                     max_parallel_chunks=5,  # NEW: limit parallel processing
+                     chunk_length_zh=100,   # NEW: chunk length for Chinese
+                     chunk_length_en=200,   # NEW: chunk length for English
+                     output_format="mp3",  # NEW: output format
+                     speech_length=0,  # NEW: target duration control
+                     diffusion_steps=10,  # NEW: diffusion steps control
+                     *args, progress=gr.Progress()):
     """Generate speech for long text using parallel chunk processing"""
     
     try:
@@ -398,6 +401,7 @@ async def gen_parallel(emo_control_method, prompt, text,
                     emo_ref_path, emo_weight, vec, emo_text, emo_random,
                     use_preset, preset_name, max_text_tokens_per_sentence,
                     speech_length=speech_length,
+                    diffusion_steps=diffusion_steps,
                     **kwargs
                 )
                 batch_tasks.append(task)
@@ -482,6 +486,7 @@ async def gen_single(emo_control_method, prompt, text,
             use_preset=False, preset_name="",  # NEW: preset parameters
             output_format="mp3",  # NEW: output format
             speech_length=0,  # NEW: target duration control
+            diffusion_steps=10,  # NEW: diffusion steps control
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -536,6 +541,7 @@ async def gen_single(emo_control_method, prompt, text,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
             speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
             speech_length=speech_length,
+            diffusion_steps=diffusion_steps,
             **kwargs
         )
     else:
@@ -553,6 +559,7 @@ async def gen_single(emo_control_method, prompt, text,
             verbose=cmd_args.verbose,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
             speech_length=speech_length,
+            diffusion_steps=diffusion_steps,
             **kwargs
         )
     
@@ -750,7 +757,7 @@ if __name__ == "__main__":
                 
                 # Emotion weight control (available for all methods except "与音色参考音频相同")
                 with gr.Group(visible=False) as emotion_weight_group:
-                    emo_weight = gr.Slider(label="Emotion Weight", minimum=0.0, maximum=1.0, value=0.5, step=0.01)
+                    emo_weight = gr.Slider(label="Emotion Weight", minimum=0.0, maximum=1.0, value=0.6, step=0.01)
                 
                 # Emotion random sampling
                 emo_random = gr.Checkbox(label="Random Emotion Sampling", value=False, visible=False)
@@ -821,6 +828,17 @@ if __name__ == "__main__":
                                 interactive=False,
                                 visible=False
                             )
+                            
+                            gr.Markdown("**Quality Control** 🎨")
+                            with gr.Row():
+                                diffusion_steps = gr.Slider(
+                                    label="Diffusion Steps",
+                                    value=10,
+                                    minimum=1,
+                                    maximum=50,
+                                    step=1,
+                                    info="Higher steps improve quality but increase latency. Fast=5, Default=10, High-quality=20-30"
+                                )
                             
                             gr.Markdown("**Output Settings**")
                             output_format = gr.Radio(
@@ -969,6 +987,7 @@ if __name__ == "__main__":
                    use_preset, preset_dropdown,  # NEW: preset inputs
                    output_format,  # NEW: output format
                    speech_length,  # NEW: duration control
+                   diffusion_steps,  # NEW: diffusion steps control
                    *advanced_params],
             outputs=[output_audio]
         )
@@ -982,6 +1001,7 @@ if __name__ == "__main__":
                    max_parallel_chunks, chunk_length_zh, chunk_length_en,  # NEW: parallel settings
                    output_format,  # NEW: output format
                    speech_length,  # NEW: duration control
+                   diffusion_steps,  # NEW: diffusion steps control
                    *advanced_params],
             outputs=[output_audio]
         )
