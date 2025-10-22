@@ -55,6 +55,63 @@ import argparse
 # Global thread executor for blocking operations
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fastapi_async")
 
+
+def estimate_speech_duration(text: str, language: str = "auto") -> int:
+    """
+    Estimate speech duration in milliseconds based on text length.
+    
+    Args:
+        text: Input text
+        language: Language hint ("zh", "en", or "auto")
+    
+    Returns:
+        Estimated duration in milliseconds
+    """
+    if not text or not text.strip():
+        return 0
+    
+    # Clean text
+    text = text.strip()
+    
+    # Detect language if auto
+    if language == "auto":
+        # Simple heuristic: if more than 30% Chinese characters, treat as Chinese
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        if chinese_chars / max(len(text), 1) > 0.3:
+            language = "zh"
+        else:
+            language = "en"
+    
+    # Speech rate estimates (characters per second)
+    # These are conservative estimates based on typical TTS output
+    if language == "zh":
+        # Chinese: ~4-5 characters per second
+        chars_per_second = 4.5
+        char_count = len([c for c in text if '\u4e00' <= c <= '\u9fff' or c.isalnum()])
+    else:
+        # English: ~12-15 characters per second (including spaces)
+        # Or ~150-180 words per minute = 2.5-3 words per second
+        chars_per_second = 13.0
+        char_count = len(text)
+    
+    # Calculate base duration
+    duration_seconds = char_count / chars_per_second
+    
+    # Add padding for punctuation pauses (10% extra time)
+    punctuation_count = sum(1 for c in text if c in ',.!?;:。，！？；：')
+    pause_time = punctuation_count * 0.3  # 300ms per punctuation
+    
+    total_duration_seconds = duration_seconds + pause_time
+    
+    # Add 10% buffer for natural speech variations
+    total_duration_seconds *= 1.1
+    
+    # Convert to milliseconds and round up to nearest 100ms
+    duration_ms = int(total_duration_seconds * 1000)
+    duration_ms = ((duration_ms + 99) // 100) * 100  # Round up to nearest 100ms
+    
+    return duration_ms
+
 parser = argparse.ArgumentParser(description="IndexTTS vLLM v2 FastAPI WebUI")
 parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
 parser.add_argument("--port", type=int, default=8000, help="Port to run the web API on")
@@ -738,6 +795,7 @@ class CloneRequest(BaseModel):
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(default="mp3")
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
     emotion_weight: float = Field(default=0.3, description="Emotion control weight (0.0 to 1.0)")
+    speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
@@ -755,6 +813,7 @@ class SpeakRequest(BaseModel):
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(default="mp3")
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
     emotion_weight: float = Field(default=0.3, description="Emotion control weight (0.0 to 1.0)")
+    speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
 
 # FastAPI lifespan
 @asynccontextmanager
@@ -1060,6 +1119,25 @@ async def home():
                                 </p>
                             </div>
                             
+                            <!-- Duration Control Section -->
+                            <div style="background: linear-gradient(135deg, #36d1dc 0%, #5b86e5 100%); padding: 20px; border-radius: 15px; margin: 20px 0;">
+                                <h4 style="color: white; margin-bottom: 15px;">⏱️ Duration Control / 时长控制</h4>
+                                <div class="form-group">
+                                    <label for="speechLength" style="color: white;">Target Duration / 目标时长 (milliseconds):</label>
+                                    <input type="number" id="speechLength" name="speechLength" 
+                                           value="0" min="0" max="600000" step="100"
+                                           placeholder="0 = auto duration"
+                                           style="margin-bottom: 15px;">
+                                    <button type="button" class="btn" onclick="estimateDuration()" style="background: rgba(255,255,255,0.3); margin-top: 5px;">
+                                        📊 Estimate Duration from Text
+                                    </button>
+                                </div>
+                                <div id="durationEstimate" style="color: white; font-weight: bold; margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.2); border-radius: 8px; display: none;"></div>
+                                <p style="color: #fff; font-size: 0.9em; margin: 10px 0 0 0;">
+                                    💡 设置为 0 表示自动时长。指定毫秒数可用于视频配音/时间控制。Set to 0 for auto duration. Specify milliseconds for video dubbing/timing control.
+                                </p>
+                            </div>
+                            
                             <button type="submit" class="btn" id="generateBtn">
                                 🎵 Generate Speech
                             </button>
@@ -1342,6 +1420,37 @@ async def home():
                 }
             }
 
+            async function estimateDuration() {
+                const text = document.getElementById('text').value;
+                if (!text.trim()) {
+                    showStatus('Please enter text first', 'error');
+                    return;
+                }
+                
+                try {
+                    showStatus('Estimating duration...', 'success');
+                    
+                    const response = await fetch('/api/estimate_duration', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({text: text, language: 'auto'})
+                    });
+                    
+                    const result = await response.json();
+                    if (result.status === 'success') {
+                        const estimateDiv = document.getElementById('durationEstimate');
+                        estimateDiv.innerHTML = `📊 Estimated: <strong>${result.duration_s}s</strong> (${result.duration_ms}ms)<br>🌐 Language: ${result.detected_language} | 📝 Characters: ${result.char_count}`;
+                        estimateDiv.style.display = 'block';
+                        document.getElementById('speechLength').value = result.duration_ms;
+                        showStatus(`Duration estimated: ${result.duration_s}s`, 'success');
+                    } else {
+                        showStatus(`Error: ${result.message}`, 'error');
+                    }
+                } catch (error) {
+                    showStatus(`Error estimating duration: ${error.message}`, 'error');
+                }
+            }
+
             async function clearOutputs() {
                 if (!confirm('Are you sure you want to clear all generated output files? This action cannot be undone.')) {
                     return;
@@ -1451,6 +1560,7 @@ async def home():
                             name: speaker,  // FlashTTS uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
+                            speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             response_format: "mp3"
                         };
                         
@@ -1466,6 +1576,7 @@ async def home():
                         cloneFormData.append('reference_audio_file', voiceFiles[0]);
                         cloneFormData.append('emotion_text', emotionText || "");
                         cloneFormData.append('emotion_weight', emotionWeight.toString());
+                        cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                         cloneFormData.append('response_format', 'mp3');
                         
                         response = await fetch('/clone_voice', {
@@ -1525,6 +1636,7 @@ async def home():
                             name: speaker,  // FlashTTS uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
+                            speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             response_format: "mp3"
                         })
                     };
@@ -1536,6 +1648,7 @@ async def home():
                     cloneFormData.append('reference_audio_file', voiceFiles[0]);
                     cloneFormData.append('emotion_text', emotionText || "");
                     cloneFormData.append('emotion_weight', emotionWeight.toString());
+                    cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                     cloneFormData.append('response_format', 'mp3');
                     requestOptions = {
                         method: 'POST',
@@ -1782,6 +1895,42 @@ async def home():
 # Health check removed - use /server_info endpoint instead
 
 # Utility endpoints
+@app.post("/api/estimate_duration")
+async def api_estimate_duration(request: Request):
+    """API: Estimate speech duration from text"""
+    try:
+        data = await request.json()
+        text = data.get("text", "")
+        language = data.get("language", "auto")
+        
+        if not text or not text.strip():
+            return JSONResponse(content={
+                "status": "error",
+                "message": "No text provided"
+            })
+        
+        duration_ms = estimate_speech_duration(text, language)
+        duration_s = duration_ms / 1000.0
+        
+        # Detect language for display
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        detected_lang = "Chinese" if chinese_chars / max(len(text), 1) > 0.3 else "English"
+        
+        return JSONResponse(content={
+            "status": "success",
+            "duration_ms": duration_ms,
+            "duration_s": round(duration_s, 1),
+            "detected_language": detected_lang,
+            "char_count": len(text)
+        })
+        
+    except Exception as e:
+        print(f"❌ Error estimating duration: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
 @app.post("/api/clear_outputs")
 async def api_clear_outputs():
     """API: Clear all generated output files"""
@@ -2052,6 +2201,7 @@ async def flashtts_speak(req: SpeakRequest):
             use_emo_text=use_emotion_text,
             emo_text=req.emotion_text if use_emotion_text else None,
             emo_alpha=req.emotion_weight,
+            speech_length=req.speech_length,
             verbose=cmd_args.verbose
         )
         
@@ -2171,6 +2321,7 @@ async def flashtts_clone_voice(
                 use_emo_text=use_emotion_text,
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
+                speech_length=req.speech_length,
                 verbose=cmd_args.verbose
             )
             
@@ -2296,6 +2447,7 @@ async def flashtts_speak_stream(req: SpeakRequest):
                     use_emo_text=use_emotion_text,
                     emo_text=req.emotion_text if use_emotion_text else None,
                     emo_alpha=req.emotion_weight,
+                    speech_length=req.speech_length,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
@@ -2391,6 +2543,7 @@ async def flashtts_clone_voice_stream(
                     use_emo_text=use_emotion_text,
                     emo_text=req.emotion_text if use_emotion_text else None,
                     emo_alpha=req.emotion_weight,
+                    speech_length=req.speech_length,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
