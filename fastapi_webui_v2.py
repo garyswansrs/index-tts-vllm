@@ -794,8 +794,9 @@ class CloneRequest(BaseModel):
     stream: bool = Field(default=False)
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(default="mp3")
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
-    emotion_weight: float = Field(default=0.3, description="Emotion control weight (0.0 to 1.0)")
+    emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
+    diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
@@ -812,8 +813,9 @@ class SpeakRequest(BaseModel):
     stream: bool = Field(default=False)
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(default="mp3")
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
-    emotion_weight: float = Field(default=0.3, description="Emotion control weight (0.0 to 1.0)")
+    emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
+    diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
 
 # FastAPI lifespan
 @asynccontextmanager
@@ -1108,9 +1110,9 @@ async def home():
                                            style="margin-bottom: 15px;">
                                 </div>
                                 <div class="form-group">
-                                    <label for="emotionWeight" style="color: white;">Emotion Strength / 情感强度: <span id="emotionWeightValue">0.3</span></label>
+                                    <label for="emotionWeight" style="color: white;">Emotion Strength / 情感强度: <span id="emotionWeightValue">0.6</span></label>
                                     <input type="range" id="emotionWeight" name="emotionWeight" 
-                                           min="0.0" max="1.0" step="0.1" value="0.3"
+                                           min="0.0" max="1.0" step="0.1" value="0.6"
                                            style="width: 100%; margin-bottom: 10px;"
                                            oninput="document.getElementById('emotionWeightValue').textContent = this.value">
                                 </div>
@@ -1135,6 +1137,21 @@ async def home():
                                 <div id="durationEstimate" style="color: white; font-weight: bold; margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.2); border-radius: 8px; display: none;"></div>
                                 <p style="color: #fff; font-size: 0.9em; margin: 10px 0 0 0;">
                                     💡 设置为 0 表示自动时长。指定毫秒数可用于视频配音/时间控制。Set to 0 for auto duration. Specify milliseconds for video dubbing/timing control.
+                                </p>
+                            </div>
+                            
+                            <!-- Diffusion Steps Control Section -->
+                            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 15px; margin: 20px 0;">
+                                <h4 style="color: white; margin-bottom: 15px;">🎨 Quality Control / 质量控制</h4>
+                                <div class="form-group">
+                                    <label for="diffusionSteps" style="color: white;">Diffusion Steps / 扩散步数: <span id="diffusionStepsValue">10</span></label>
+                                    <input type="range" id="diffusionSteps" name="diffusionSteps" 
+                                           min="1" max="50" step="1" value="10"
+                                           style="width: 100%; margin-bottom: 10px;"
+                                           oninput="document.getElementById('diffusionStepsValue').textContent = this.value">
+                                </div>
+                                <p style="color: #fff; font-size: 0.9em; margin: 0;">
+                                    💡 更高的步数可以提高音质但会增加延迟。建议值: 快速=5, 默认=10, 高质量=20-30。Higher steps improve quality but increase latency. Recommended: Fast=5, Default=10, High-quality=20-30.
                                 </p>
                             </div>
                             
@@ -1238,7 +1255,7 @@ async def home():
                         <h4>🆕 Emotion Text Control</h4>
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>emotion_text</strong> (optional): Emotion description (e.g., "happy and excited")</li>
-                            <li><strong>emotion_weight</strong> (optional): Strength 0.0-1.0 (default: 0.3)</li>
+                            <li><strong>emotion_weight</strong> (optional): Strength 0.0-1.0 (default: 0.6)</li>
                             <li>Example: <code>{"text": "Hello", "name": "speaker1", "emotion_text": "cheerful", "emotion_weight": 0.7}</code></li>
                         </ul>
                     </div>
@@ -1527,6 +1544,7 @@ async def home():
                 const speaker = formData.get('speaker');
                 const emotionText = document.getElementById('emotionText').value;
                 const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
+                const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
                 const streamingMode = document.getElementById('streamingMode').checked;
                 
                 if (!text.trim()) {
@@ -1539,17 +1557,17 @@ async def home():
                     
                     if (streamingMode) {
                         // Streaming mode
-                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, formData, startTime);
+                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime);
                     } else {
                         // Regular mode
-                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, formData, startTime);
+                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime);
                     }
                 } catch (error) {
                     showStatus(`Network error: ${error.message}`, 'error');
                 }
             });
 
-            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, formData, startTime) {
+            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime) {
                     let response;
                     const voiceFiles = document.getElementById('voice_files').files;
                     
@@ -1561,6 +1579,7 @@ async def home():
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
+                            diffusion_steps: diffusionSteps,
                             response_format: "mp3"
                         };
                         
@@ -1577,6 +1596,7 @@ async def home():
                         cloneFormData.append('emotion_text', emotionText || "");
                         cloneFormData.append('emotion_weight', emotionWeight.toString());
                         cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
+                        cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                         cloneFormData.append('response_format', 'mp3');
                         
                         response = await fetch('/clone_voice', {
@@ -1615,7 +1635,7 @@ async def home():
                     }
             }
 
-            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, formData, startTime) {
+            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime) {
                 showStatus('⚡ Streaming: Waiting for first chunk...', 'success');
                 
                 // Get first chunk size setting
@@ -1637,6 +1657,7 @@ async def home():
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
+                            diffusion_steps: diffusionSteps,
                             response_format: "mp3"
                         })
                     };
@@ -1649,6 +1670,7 @@ async def home():
                     cloneFormData.append('emotion_text', emotionText || "");
                     cloneFormData.append('emotion_weight', emotionWeight.toString());
                     cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
+                    cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                     cloneFormData.append('response_format', 'mp3');
                     requestOptions = {
                         method: 'POST',
@@ -2202,6 +2224,7 @@ async def flashtts_speak(req: SpeakRequest):
             emo_text=req.emotion_text if use_emotion_text else None,
             emo_alpha=req.emotion_weight,
             speech_length=req.speech_length,
+            diffusion_steps=req.diffusion_steps,
             verbose=cmd_args.verbose
         )
         
@@ -2271,7 +2294,8 @@ def parse_clone_form(
     stream: bool = Form(False),
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Form("mp3"),
     emotion_text: Optional[str] = Form(""),
-    emotion_weight: float = Form(0.3),
+    emotion_weight: float = Form(0.6),
+    diffusion_steps: int = Form(10),
 ):
     return CloneRequest(
         text=text, reference_audio=reference_audio, reference_text=reference_text,
@@ -2279,7 +2303,8 @@ def parse_clone_form(
         repetition_penalty=repetition_penalty, max_tokens=max_tokens,
         length_threshold=length_threshold, window_size=window_size,
         stream=stream, response_format=response_format,
-        emotion_text=emotion_text, emotion_weight=emotion_weight
+        emotion_text=emotion_text, emotion_weight=emotion_weight,
+        diffusion_steps=diffusion_steps
     )
 
 @app.post("/clone_voice")
@@ -2322,6 +2347,7 @@ async def flashtts_clone_voice(
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
                 speech_length=req.speech_length,
+                diffusion_steps=req.diffusion_steps,
                 verbose=cmd_args.verbose
             )
             
@@ -2448,6 +2474,7 @@ async def flashtts_speak_stream(req: SpeakRequest):
                     emo_text=req.emotion_text if use_emotion_text else None,
                     emo_alpha=req.emotion_weight,
                     speech_length=req.speech_length,
+                    diffusion_steps=req.diffusion_steps,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
@@ -2544,6 +2571,7 @@ async def flashtts_clone_voice_stream(
                     emo_text=req.emotion_text if use_emotion_text else None,
                     emo_alpha=req.emotion_weight,
                     speech_length=req.speech_length,
+                    diffusion_steps=req.diffusion_steps,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
