@@ -74,6 +74,63 @@ os.makedirs("speaker_presets", exist_ok=True)
 MAX_LENGTH_TO_USE_SPEED = 70
 
 
+def estimate_speech_duration(text: str, language: str = "auto") -> int:
+    """
+    Estimate speech duration in milliseconds based on text length.
+    
+    Args:
+        text: Input text
+        language: Language hint ("zh", "en", or "auto")
+    
+    Returns:
+        Estimated duration in milliseconds
+    """
+    if not text or not text.strip():
+        return 0
+    
+    # Clean text
+    text = text.strip()
+    
+    # Detect language if auto
+    if language == "auto":
+        # Simple heuristic: if more than 30% Chinese characters, treat as Chinese
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        if chinese_chars / max(len(text), 1) > 0.3:
+            language = "zh"
+        else:
+            language = "en"
+    
+    # Speech rate estimates (characters per second)
+    # These are conservative estimates based on typical TTS output
+    if language == "zh":
+        # Chinese: ~4-5 characters per second
+        chars_per_second = 4.5
+        char_count = len([c for c in text if '\u4e00' <= c <= '\u9fff' or c.isalnum()])
+    else:
+        # English: ~12-15 characters per second (including spaces)
+        # Or ~150-180 words per minute = 2.5-3 words per second
+        chars_per_second = 13.0
+        char_count = len(text)
+    
+    # Calculate base duration
+    duration_seconds = char_count / chars_per_second
+    
+    # Add padding for punctuation pauses (10% extra time)
+    punctuation_count = sum(1 for c in text if c in ',.!?;:。，！？；：')
+    pause_time = punctuation_count * 0.3  # 300ms per punctuation
+    
+    total_duration_seconds = duration_seconds + pause_time
+    
+    # Add 10% buffer for natural speech variations
+    total_duration_seconds *= 1.1
+    
+    # Convert to milliseconds and round up to nearest 100ms
+    duration_ms = int(total_duration_seconds * 1000)
+    duration_ms = ((duration_ms + 99) // 100) * 100  # Round up to nearest 100ms
+    
+    return duration_ms
+
+
 # Load example cases
 with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
     example_cases = []
@@ -164,7 +221,7 @@ def convert_audio_format(input_path, output_format="mp3", bitrate="128k"):
 
 async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt, 
                         emo_ref_path, emo_weight, vec, emo_text, emo_random,
-                        use_preset, preset_name, max_text_tokens_per_sentence, **kwargs):
+                        use_preset, preset_name, max_text_tokens_per_sentence, speech_length=0, **kwargs):
     """Generate audio for a single text chunk"""
     try:
         output_path = os.path.join("outputs", f"chunk_{chunk_index}_{int(time.time())}.wav")
@@ -184,6 +241,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                 speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
+                speech_length=speech_length,
                 **kwargs
             )
         else:
@@ -199,6 +257,7 @@ async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt,
                 use_random=emo_random,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                speech_length=speech_length,
                 **kwargs
             )
         
@@ -260,6 +319,7 @@ async def gen_parallel(emo_control_method, prompt, text,
                       chunk_length_zh=100,   # NEW: chunk length for Chinese
                       chunk_length_en=200,   # NEW: chunk length for English
                       output_format="mp3",  # NEW: output format
+                      speech_length=0,  # NEW: target duration control
                       *args, progress=gr.Progress()):
     """Generate speech for long text using parallel chunk processing"""
     
@@ -318,7 +378,7 @@ async def gen_parallel(emo_control_method, prompt, text,
                                   emo_ref_path, emo_weight,
                                   vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                                   emo_text, emo_random, max_text_tokens_per_sentence,
-                                  use_preset, preset_name, output_format, *args, progress=progress)
+                                  use_preset, preset_name, output_format, speech_length, *args, progress=progress)
         
         # Process chunks in parallel with concurrency limit
         progress(0, desc="Generating audio chunks...")
@@ -337,6 +397,7 @@ async def gen_parallel(emo_control_method, prompt, text,
                     chunk, chunk_index, emo_control_method, prompt,
                     emo_ref_path, emo_weight, vec, emo_text, emo_random,
                     use_preset, preset_name, max_text_tokens_per_sentence,
+                    speech_length=speech_length,
                     **kwargs
                 )
                 batch_tasks.append(task)
@@ -420,6 +481,7 @@ async def gen_single(emo_control_method, prompt, text,
             max_text_tokens_per_sentence=120,
             use_preset=False, preset_name="",  # NEW: preset parameters
             output_format="mp3",  # NEW: output format
+            speech_length=0,  # NEW: target duration control
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -473,6 +535,7 @@ async def gen_single(emo_control_method, prompt, text,
             verbose=cmd_args.verbose,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
             speaker_preset=preset_name,  # NEW: Use speaker_preset parameter
+            speech_length=speech_length,
             **kwargs
         )
     else:
@@ -489,6 +552,7 @@ async def gen_single(emo_control_method, prompt, text,
             use_random=emo_random,
             verbose=cmd_args.verbose,
             max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+            speech_length=speech_length,
             **kwargs
         )
     
@@ -739,6 +803,25 @@ if __name__ == "__main__":
                                 info="Recommended: 80-200. Higher = longer sentences, Lower = more fragmented"
                             )
                             
+                            gr.Markdown("**Duration Control** ⏱️")
+                            with gr.Row():
+                                speech_length = gr.Number(
+                                    label="Target Duration (ms)",
+                                    value=0,
+                                    minimum=0,
+                                    maximum=600000,
+                                    step=100,
+                                    info="0 = auto duration. Set specific duration for dubbing/timing control."
+                                )
+                                estimate_button = gr.Button("📊 Estimate", size="sm")
+                            
+                            estimated_duration = gr.Textbox(
+                                label="Estimated Duration",
+                                value="",
+                                interactive=False,
+                                visible=False
+                            )
+                            
                             gr.Markdown("**Output Settings**")
                             output_format = gr.Radio(
                                 choices=["mp3", "wav"],
@@ -801,6 +884,23 @@ if __name__ == "__main__":
                     info_button = gr.Button("Refresh Preset Info")
                     preset_info = gr.Markdown(value=get_preset_info())
         # Event handlers
+        def on_estimate_duration(text):
+            """Estimate speech duration from text"""
+            if not text or not text.strip():
+                return gr.update(value="⚠️ No text entered", visible=True)
+            
+            duration_ms = estimate_speech_duration(text, language="auto")
+            duration_s = duration_ms / 1000.0
+            
+            # Detect language for display
+            chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+            lang = "Chinese" if chinese_chars / max(len(text), 1) > 0.3 else "English"
+            
+            return gr.update(
+                value=f"📊 Estimated: {duration_s:.1f}s ({duration_ms}ms) | Language: {lang} | {len(text)} chars",
+                visible=True
+            )
+        
         def on_input_text_change(text, max_tokens_per_sentence):
             if text and len(text) > 0:
                 text_tokens_list = tts.tokenizer.tokenize(text)
@@ -855,6 +955,12 @@ if __name__ == "__main__":
         
         prompt_audio.upload(update_prompt_audio, outputs=[gen_button])
         
+        estimate_button.click(
+            on_estimate_duration,
+            inputs=[input_text_single],
+            outputs=[estimated_duration]
+        )
+        
         gen_button.click(
             gen_single,
             inputs=[emo_control_method, prompt_audio, input_text_single, emo_upload, emo_weight,
@@ -862,6 +968,7 @@ if __name__ == "__main__":
                    emo_text, emo_random, max_text_tokens_per_sentence,
                    use_preset, preset_dropdown,  # NEW: preset inputs
                    output_format,  # NEW: output format
+                   speech_length,  # NEW: duration control
                    *advanced_params],
             outputs=[output_audio]
         )
@@ -874,6 +981,7 @@ if __name__ == "__main__":
                    use_preset, preset_dropdown,  # NEW: preset inputs
                    max_parallel_chunks, chunk_length_zh, chunk_length_en,  # NEW: parallel settings
                    output_format,  # NEW: output format
+                   speech_length,  # NEW: duration control
                    *advanced_params],
             outputs=[output_audio]
         )
