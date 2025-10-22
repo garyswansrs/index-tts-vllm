@@ -335,8 +335,14 @@ class IndexTTS2:
     async def _process_sentence(self, sent, sent_idx, spk_cond_emb, emo_cond_emb, 
                                 emo_vector, emovec_mat, weight_vector, emo_alpha, 
                                 use_random, prompt_condition, ref_mel, style,
+                                speech_length=0, text_tokens_list=None,
                                 verbose=False):
-        """Process a single sentence and return the generated waveform and timing stats"""
+        """Process a single sentence and return the generated waveform and timing stats
+        
+        Args:
+            speech_length: Target audio duration in milliseconds. If 0, uses default duration calculation.
+            text_tokens_list: Full list of text tokens (needed for speech_length calculation)
+        """
         text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
         text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
 
@@ -413,7 +419,29 @@ class IndexTTS2:
                 S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                 S_infer = S_infer.transpose(1, 2)
                 S_infer = S_infer + latent
-                target_lengths = (code_lens * 1.72).long()
+                
+                # Calculate target_lengths based on speech_length parameter
+                base_target_lengths = (code_lens * 1.72).long()
+                if speech_length == 0:
+                    target_lengths = base_target_lengths
+                else:
+                    # Calculate duration ratio based on target speech_length
+                    frame_duration = 11.61  # mel token duration ms = 256 / sampling_rate * 1000
+                    len_total = len(text_tokens_list) if text_tokens_list is not None else 0  # total token amount
+                    len_current = len(sent)  # current token amount
+                    
+                    if len_total <= 0:  # use default audio duration logic if something breaks
+                        target_lengths = base_target_lengths
+                        if verbose:
+                            print(f"!!! Falling back to default duration logic for {sent_idx} segment")
+                    else:
+                        duration_ratio = len_current / len_total
+                        target_chunk_ms = speech_length * duration_ratio
+                        if verbose:
+                            print(f">> Generating segment {sent_idx}: {duration_ratio*100:.2f}% of total audio duration ({int(target_chunk_ms)}ms)")
+                        len_tensor = torch.LongTensor([int(speech_length*duration_ratio)])
+                        len_tensor = len_tensor.to(self.device)
+                        target_lengths = torch.clamp((len_tensor/frame_duration).long(), min=1)
 
                 cond = self.s2mel.models['length_regulator'](S_infer,
                                                              ylens=target_lengths,
@@ -456,7 +484,7 @@ class IndexTTS2:
         """
         Shared preparation logic for both infer and infer_stream methods.
         Returns: (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel, 
-                 emovec_mat, weight_vector, sampling_rate)
+                 emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list)
         
         Args:
             first_chunk_max_tokens: If provided, splits first chunk with this size for streaming.
@@ -639,7 +667,7 @@ class IndexTTS2:
         sampling_rate = 22050
         
         return (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-                emovec_mat, weight_vector, emo_vector, sampling_rate)
+                emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list)
 
     async def infer_stream(self, spk_audio_prompt, text,
               emo_audio_prompt=None, emo_alpha=0.5,
@@ -647,7 +675,7 @@ class IndexTTS2:
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120,
               first_chunk_max_tokens=40,  # Smaller size for first chunk for faster response
-              speaker_preset=None, **generation_kwargs):
+              speaker_preset=None, speech_length=0, **generation_kwargs):
         """
         Streaming inference that yields audio chunks as they are generated.
         Yields (chunk_index, wav_data, is_last) tuples.
@@ -656,13 +684,14 @@ class IndexTTS2:
             first_chunk_max_tokens: Maximum tokens for the first chunk (default: 40).
                                    Smaller value = faster first response.
                                    Recommended range: 20-60 tokens.
+            speech_length: Target audio duration in milliseconds. If 0, uses default duration calculation.
         """
         print(">> start streaming inference...")
         start_time = time.perf_counter()
 
         # Use shared preparation logic with first_chunk_max_tokens for optimized splitting
         (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-         emovec_mat, weight_vector, emo_vector, sampling_rate) = await self._prepare_inference(
+         emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list) = await self._prepare_inference(
             spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
             use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
             speaker_preset, verbose,
@@ -681,7 +710,8 @@ class IndexTTS2:
                 sent, sent_idx, spk_cond_emb, emo_cond_emb,
                 emo_vector, emovec_mat,
                 weight_vector,
-                emo_alpha, use_random, prompt_condition, ref_mel, style, verbose
+                emo_alpha, use_random, prompt_condition, ref_mel, style,
+                speech_length, text_tokens_list, verbose
             )
             
             # Add interval silence if not the last sentence
@@ -702,13 +732,13 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_sentence=120, 
-              speaker_preset=None, **generation_kwargs):
+              speaker_preset=None, speech_length=0, **generation_kwargs):
         print(">> start inference...")
         start_time = time.perf_counter()
 
         # Prepare all inputs using shared logic
         (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
-         emovec_mat, weight_vector, emo_vector, sampling_rate) = await self._prepare_inference(
+         emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list) = await self._prepare_inference(
             spk_audio_prompt, text, emo_audio_prompt, emo_alpha, emo_vector,
             use_emo_text, emo_text, use_random, max_text_tokens_per_sentence,
             speaker_preset, verbose
@@ -721,7 +751,8 @@ class IndexTTS2:
                 sent, sent_idx, spk_cond_emb, emo_cond_emb,
                 emo_vector, emovec_mat,
                 weight_vector,
-                emo_alpha, use_random, prompt_condition, ref_mel, style, verbose
+                emo_alpha, use_random, prompt_condition, ref_mel, style,
+                speech_length, text_tokens_list, verbose
             )
             for sent_idx, sent in enumerate(sentences)
         ]
