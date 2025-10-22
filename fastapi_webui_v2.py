@@ -1127,7 +1127,7 @@ async def home():
                                 <div class="form-group">
                                     <label for="speechLength" style="color: white;">Target Duration / 目标时长 (milliseconds):</label>
                                     <input type="number" id="speechLength" name="speechLength" 
-                                           value="0" min="0" max="600000" step="100"
+                                           value="0" min="0" max="6000000" step="100"
                                            placeholder="0 = auto duration"
                                            style="margin-bottom: 15px;">
                                     <button type="button" class="btn" onclick="estimateDuration()" style="background: rgba(255,255,255,0.3); margin-top: 5px;">
