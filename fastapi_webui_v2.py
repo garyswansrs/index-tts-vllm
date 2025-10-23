@@ -7,7 +7,7 @@ with the API structure from deploy_vllm_indextts.py, using IndexTTS vLLM v2 as b
 Features:
 - IndexTTS vLLM v2 backend for ultra-fast inference
 - Speaker preset management with persistent storage
-- FlashTTS API compatibility
+- API compatibility for external integrations
 - Modern web interface with Chinese support
 - Parallel chunk processing for long texts
 - MP3 output support
@@ -46,8 +46,6 @@ sys.path.insert(0, os.path.join(current_dir, "indextts"))
 
 from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
-
-from tools.i18n.i18n import I18nAuto
 
 # Configuration
 import argparse
@@ -140,19 +138,6 @@ os.makedirs("outputs", exist_ok=True)
 os.makedirs("prompts", exist_ok=True)
 os.makedirs("speaker_presets", exist_ok=True)
 
-# Initialize i18n
-i18n = I18nAuto(language="Auto")
-
-# Constants
-EMO_CHOICES = [
-    i18n("与音色参考音频相同"),
-    i18n("使用情感参考音频"),
-    i18n("使用情感向量控制"),
-    i18n("使用情感描述文本控制")
-]
-
-MAX_LENGTH_TO_USE_SPEED = 70
-
 # Async wrapper functions for blocking operations
 async def async_write_file(file_path: str, data: bytes) -> None:
     """Async wrapper for writing file data"""
@@ -190,16 +175,6 @@ async def async_audio_read(file_path: str):
     """Async wrapper for soundfile.read()"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, sf.read, file_path)
-
-async def async_audio_write(file_path: str, data, sample_rate: int, format: str = 'WAV'):
-    """Async wrapper for soundfile.write()"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, sf.write, file_path, data, sample_rate, format)
-
-async def async_audio_convert(input_path: str, output_format: str = "mp3", bitrate: str = "128k"):
-    """Async wrapper for audio conversion"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, convert_audio_format, input_path, output_format, bitrate)
 
 async def async_cut_audio_to_duration(input_path: str, max_duration: float = 10.0):
     """Async wrapper for smart audio cutting at silence intervals"""
@@ -366,65 +341,6 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         print(f"❌ Error cutting audio: {e}")
         # Return original path if cutting fails
         return input_path
-
-
-def convert_audio_format(input_path, output_format="mp3", bitrate="128k"):
-    """Convert audio file to specified format"""
-    if output_format.lower() == "wav":
-        # Keep original WAV format
-        return input_path
-    
-    try:
-        # Load audio using pydub
-        audio = AudioSegment.from_wav(input_path)
-        
-        # Generate output path
-        input_name = os.path.splitext(input_path)[0]
-        output_path = f"{input_name}.{output_format}"
-        
-        if output_format.lower() == "mp3":
-            # Export as MP3 with specified bitrate
-            audio.export(output_path, format="mp3", bitrate=bitrate)
-            
-            # Get file sizes for comparison
-            wav_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
-            mp3_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
-            compression_ratio = wav_size / mp3_size if mp3_size > 0 else 1
-            
-            print(f"🔄 Audio converted: WAV ({wav_size:.1f}MB) → MP3 ({mp3_size:.1f}MB)")
-            print(f"📦 Compression ratio: {compression_ratio:.1f}x smaller")
-            
-            # Remove original WAV file to save space
-            try:
-                os.remove(input_path)
-                print(f"🗑️ Original WAV file removed")
-            except Exception as cleanup_error:
-                print(f"⚠️ Could not remove original WAV: {cleanup_error}")
-                
-        else:
-            # Other formats (flac, ogg, etc.)
-            audio.export(output_path, format=output_format)
-            print(f"🔄 Audio converted to {output_format.upper()}")
-            try:
-                os.remove(input_path)
-                print(f"🗑️ Original WAV file removed")
-            except Exception as cleanup_error:
-                print(f"⚠️ Could not remove original WAV: {cleanup_error}")
-        
-        return output_path
-        
-    except ImportError as import_error:
-        error_msg = f"❌ Audio conversion failed: Missing dependency - {import_error}"
-        print(error_msg)
-        print("💡 Install required packages: pip install pydub")
-        if "mp3" in output_format.lower():
-            print("💡 For MP3 support: pip install pydub[mp3] or install ffmpeg")
-        raise Exception(error_msg)
-        
-    except Exception as e:
-        error_msg = f"❌ Audio conversion to {output_format.upper()} failed: {e}"
-        print(error_msg)
-        raise Exception(error_msg)
 
 async def convert_audio_to_format(wav_data, sample_rate, output_format="mp3", bitrate="128k"):
     """Convert audio data to specified format (MP3 or WAV)"""
@@ -604,14 +520,14 @@ class SpeakerAPIWrapper:
                     return {"status": "error", "message": f"Failed to add speaker '{speaker_name}'"}
             
             finally:
-                # Clean up temporary files
+                # Clean up temporary files asynchronously
                 try:
                     # Clean up original temp file (if different from cut file)
                     if temp_path.exists():
-                        temp_path.unlink()
+                        await async_remove_file(str(temp_path))
                     # Clean up cut file if it's different and exists
                     if cut_temp_path != str(temp_path) and os.path.exists(cut_temp_path):
-                        os.remove(cut_temp_path)
+                        await async_remove_file(cut_temp_path)
                 except:
                     pass
             
@@ -690,94 +606,7 @@ class SpeakerAPIWrapper:
 # Global speaker API wrapper (will be initialized after TTS)
 speaker_api = None
 
-# Generation functions
-async def generate_chunk(chunk_text, chunk_index, emo_control_method, prompt, 
-                        emo_ref_path, emo_weight, vec, emo_text, emo_random,
-                        use_preset, preset_name, max_text_tokens_per_sentence, **kwargs):
-    """Generate audio for a single text chunk"""
-    try:
-        output_path = os.path.join("outputs", f"chunk_{chunk_index}_{uuid.uuid4().hex[:12]}.wav")
-        
-        
-        if use_preset and preset_name and preset_name != "None":
-            output = await tts_manager.get_tts().infer(
-                spk_audio_prompt="",
-                text=chunk_text,
-                output_path=output_path,
-                emo_audio_prompt=emo_ref_path,
-                emo_alpha=emo_weight,
-                emo_vector=vec,
-                use_emo_text=(emo_control_method==3),
-                emo_text=emo_text,
-                use_random=emo_random,
-                verbose=cmd_args.verbose,
-                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                speaker_preset=preset_name,
-                **kwargs
-            )
-        else:
-            output = await tts_manager.get_tts().infer(
-                spk_audio_prompt=prompt,
-                text=chunk_text,
-                output_path=output_path,
-                emo_audio_prompt=emo_ref_path,
-                emo_alpha=emo_weight,
-                emo_vector=vec,
-                use_emo_text=(emo_control_method==3),
-                emo_text=emo_text,
-                use_random=emo_random,
-                verbose=cmd_args.verbose,
-                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                **kwargs
-            )
-        
-        return chunk_index, output
-    except Exception as e:
-        print(f"❌ Error generating chunk {chunk_index}: {e}")
-        print(f"📝 Chunk text: {chunk_text}")
-        traceback.print_exc()
-        return chunk_index, None
-
-async def combine_audio_chunks(chunk_results, output_path, sample_rate=22050):
-    """Combine multiple audio files into one"""
-    try:
-        # Sort by chunk index to maintain order
-        chunk_results.sort(key=lambda x: x[0])
-        
-        # Load and combine audio data
-        combined_audio = []
-        for chunk_idx, audio_path in chunk_results:
-            if audio_path and os.path.exists(audio_path):
-                audio_data, sr = await async_audio_read(audio_path)
-                if len(audio_data.shape) > 1:
-                    audio_data = audio_data[:, 0]  # Take first channel if stereo
-                combined_audio.append(audio_data)
-                
-                # Clean up chunk file
-                await async_remove_file(audio_path)
-            else:
-                print(f"⚠️ Warning: Missing audio for chunk {chunk_idx}")
-        
-        if not combined_audio:
-            raise ValueError("No valid audio chunks to combine")
-        
-        # Concatenate all audio with small silence gaps (100ms)
-        silence_samples = int(0.1 * sample_rate)  # 100ms silence
-        silence = np.zeros(silence_samples)
-        
-        final_audio = combined_audio[0]
-        for audio_chunk in combined_audio[1:]:
-            final_audio = np.concatenate([final_audio, silence, audio_chunk])
-        
-        # Save combined audio
-        await async_audio_write(output_path, final_audio, sample_rate)
-        return output_path
-        
-    except Exception as e:
-        print(f"❌ Error combining audio chunks: {e}")
-        return None
-
-# FlashTTS API Models
+# API Models
 class CloneRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
     reference_audio: Optional[str] = Field(default=None, description="Reference audio URL or base64")
@@ -797,6 +626,7 @@ class CloneRequest(BaseModel):
     emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
+    max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
@@ -816,6 +646,7 @@ class SpeakRequest(BaseModel):
     emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
+    max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
 
 # FastAPI lifespan
 @asynccontextmanager
@@ -1005,7 +836,7 @@ async def home():
                     <span class="performance-badge">🇨🇳 Chinese Support</span>
                     <span class="performance-badge">🎭 Speaker Presets</span>
                     <span class="performance-badge">🎵 MP3 Output</span>
-                    <span class="performance-badge">🔌 FlashTTS API</span>
+                    <span class="performance-badge">🔌 API Integration</span>
                     <span class="performance-badge">😊 Emotion Text Control</span>
                     <span class="performance-badge">🌊 Streaming Mode</span>
                 </div>
@@ -1155,6 +986,26 @@ async def home():
                                 </p>
                             </div>
                             
+                            <!-- Text Tokens Per Sentence Control Section -->
+                            <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 20px; border-radius: 15px; margin: 20px 0;">
+                                <h4 style="color: white; margin-bottom: 15px;">✂️ Text Splitting / 文本分句</h4>
+                                <div class="form-group">
+                                    <label for="maxTextTokens" style="color: white;">Max Tokens Per Sentence / 每句最大Token数: <span id="maxTextTokensValue">120</span></label>
+                                    <input type="range" id="maxTextTokens" name="maxTextTokens" 
+                                           min="80" max="200" step="10" value="120"
+                                           style="width: 100%; margin-bottom: 10px;"
+                                           oninput="document.getElementById('maxTextTokensValue').textContent = this.value">
+                                </div>
+                                <div style="display: flex; justify-content: space-between; font-size: 0.85em; color: #fff;">
+                                    <span>Short (80)</span>
+                                    <span>Balanced (120)</span>
+                                    <span>Long (200)</span>
+                                </div>
+                                <p style="color: #fff; font-size: 0.9em; margin: 10px 0 0 0;">
+                                    💡 控制每个句子的最大长度。较短=更多句子但处理更快，较长=更少句子但减少断句。Controls max sentence length. Shorter = more sentences but faster processing, Longer = fewer sentences but fewer breaks.
+                                </p>
+                            </div>
+                            
                             <button type="submit" class="btn" id="generateBtn">
                                 🎵 Generate Speech
                             </button>
@@ -1205,59 +1056,214 @@ async def home():
                     <div class="form-section">
                         <h3>📚 API Endpoints</h3>
                         
-                        <h4 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px; border-radius: 8px;">🔷 FlashTTS-Compatible API (for external use)</h4>
+                        <h4 style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px; border-radius: 8px;">🔷 API Endpoints (Recommended for External Use)</h4>
                         
-                        <h5>Server Information</h5>
+                        <h5>🔍 Server Information</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>GET /server_info</strong> - Get server information and available speakers</li>
-                        </ul>
-                        
-                        <h5>Speaker Management</h5>
-                        <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>GET /audio_roles</strong> - List available speakers (returns: <code>{"success": true, "roles": [...]}</code>)</li>
-                            <li><strong>POST /add_speaker</strong> - Add new speaker (with reference audio)</li>
-                            <li><strong>POST /delete_speaker</strong> - Delete speaker</li>
-                        </ul>
-                        
-                        <h5>Speech Generation - Non-Streaming</h5>
-                        <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>POST /speak</strong> - Generate speech using registered speaker
+                            <li><strong>GET /server_info</strong> - Get server information, model details, and available speakers
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Parameters: <code>text</code>, <code>name</code>, <code>response_format</code> (mp3/opus/aac/flac/wav/pcm)</li>
-                                    <li>Supports emotion: <code>emotion_text</code>, <code>emotion_weight</code></li>
-                                </ul>
-                            </li>
-                            <li><strong>POST /clone_voice</strong> - Clone voice using reference audio
-                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Parameters: <code>text</code>, <code>reference_audio</code>, <code>response_format</code></li>
-                                    <li>Supports emotion: <code>emotion_text</code>, <code>emotion_weight</code></li>
+                                    <li>Returns: Server version, model name, speaker list, capabilities</li>
                                 </ul>
                             </li>
                         </ul>
                         
-                        <h5>⚡ Speech Generation - Streaming</h5>
+                        <h5>👥 Speaker Management</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>POST /speak_stream</strong> - Generate speech (streaming)
+                            <li><strong>GET /audio_roles</strong> - List all available speaker presets
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Returns: <code>{"success": true, "roles": ["speaker1", "speaker2", ...]}</code></li>
+                                </ul>
+                            </li>
+                            <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
+                                    <li>Audio will be automatically trimmed to 3-15 seconds at silence points</li>
+                                </ul>
+                            </li>
+                            <li><strong>POST /delete_speaker</strong> - Remove an existing speaker preset
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Form data: <code>name</code> (string)</li>
+                                </ul>
+                            </li>
+                        </ul>
+                        
+                        <h5>🎙️ Speech Generation - Non-Streaming (Standard Mode)</h5>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>POST /speak</strong> - Generate speech using a registered speaker preset
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Required: <code>text</code> (string), <code>name</code> (speaker name)</li>
+                                    <li>Optional: <code>response_format</code> (mp3/opus/aac/flac/wav/pcm, default: mp3)</li>
+                                    <li>Optional: <code>emotion_text</code> (emotion description), <code>emotion_weight</code> (0.0-1.0)</li>
+                                    <li>Optional: <code>diffusion_steps</code> (int, default: 10)</li>
+                                    <li>Optional: <code>max_text_tokens_per_sentence</code> (int, 80-200, default: 120) - Controls text splitting</li>
+                                    <li>Returns: Audio file in specified format</li>
+                                </ul>
+                            </li>
+                            <li><strong>POST /clone_voice</strong> - Clone voice using uploaded reference audio (zero-shot)
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Required: <code>text</code> (string), <code>reference_audio_file</code> (file upload)</li>
+                                    <li>Optional: Same as /speak (response_format, emotion_text, emotion_weight, diffusion_steps, max_text_tokens_per_sentence)</li>
+                                    <li>Returns: Audio file cloned from reference voice</li>
+                                </ul>
+                            </li>
+                        </ul>
+                        
+                        <h5>⚡ Speech Generation - Streaming (Low Latency Mode)</h5>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>POST /speak_stream</strong> - Generate speech with streaming chunks
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Same parameters as <code>/speak</code></li>
-                                    <li>Format: <code>CHUNK:{idx}:{size}:{status}\n{audio_bytes}</code></li>
+                                    <li>Streams audio chunks as they're generated</li>
+                                    <li>Response format: <code>CHUNK:{idx}:{size}:{status}\n{audio_bytes}</code></li>
+                                    <li>Status: CONTINUE (more chunks coming) or LAST (final chunk)</li>
                                 </ul>
                             </li>
-                            <li><strong>POST /clone_voice_stream</strong> - Clone voice (streaming)
+                            <li><strong>POST /clone_voice_stream</strong> - Clone voice with streaming
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Same parameters as <code>/clone_voice</code></li>
+                                    <li>Same streaming format as /speak_stream</li>
                                 </ul>
                             </li>
                         </ul>
                         
                         <hr style="margin: 20px 0; border: none; border-top: 2px solid #f0f0f0;">
                         
-                        <h4>🆕 Emotion Text Control</h4>
+                        <h4 style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%); color: white; padding: 10px; border-radius: 8px;">🔧 Utility API (WebUI Internal)</h4>
+                        
+                        <h5>🛠️ Helper Endpoints</h5>
                         <ul style="margin-left: 20px; line-height: 1.6;">
-                            <li><strong>emotion_text</strong> (optional): Emotion description (e.g., "happy and excited")</li>
-                            <li><strong>emotion_weight</strong> (optional): Strength 0.0-1.0 (default: 0.6)</li>
-                            <li>Example: <code>{"text": "Hello", "name": "speaker1", "emotion_text": "cheerful", "emotion_weight": 0.7}</code></li>
+                            <li><strong>POST /api/estimate_duration</strong> - Estimate speech duration from text
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>JSON body: <code>{"text": "...", "language": "auto"}</code></li>
+                                    <li>Returns: Estimated duration in seconds and milliseconds</li>
+                                </ul>
+                            </li>
+                            <li><strong>POST /api/clear_outputs</strong> - Clear all generated output files
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>No parameters required</li>
+                                    <li>Returns: Number of files deleted and disk space freed</li>
+                                </ul>
+                            </li>
                         </ul>
+                        
+                        <hr style="margin: 20px 0; border: none; border-top: 2px solid #f0f0f0;">
+                        
+                        <h4>🆕 Emotion Text Control Feature</h4>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>emotion_text</strong> (optional): Natural language emotion description
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Examples: "happy and excited", "sad and melancholic", "calm and peaceful", "angry and frustrated"</li>
+                                </ul>
+                            </li>
+                            <li><strong>emotion_weight</strong> (optional): Control emotion intensity (0.0 = no emotion, 1.0 = maximum)
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Default: 0.6 (moderate intensity)</li>
+                                    <li>Recommended range: 0.3-0.9</li>
+                                </ul>
+                            </li>
+                            <li><strong>Example usage:</strong>
+                                <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px; margin-top: 10px; overflow-x: auto;"><code>{
+  "text": "Hello, how are you today?",
+  "name": "speaker1",
+  "emotion_text": "cheerful and friendly",
+  "emotion_weight": 0.7,
+  "response_format": "mp3"
+}</code></pre>
+                            </li>
+                        </ul>
+                        
+                        <hr style="margin: 20px 0; border: none; border-top: 2px solid #f0f0f0;">
+                        
+                        <h4>✂️ Text Splitting Control</h4>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>max_text_tokens_per_sentence</strong> (optional): Maximum tokens per sentence for text splitting (80-200)
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Default: 120 tokens</li>
+                                    <li>Range: 80-200 tokens</li>
+                                    <li>Lower values (80-100): More sentences, faster processing, may sound choppy</li>
+                                    <li>Balanced (110-130): Good balance of quality and processing speed</li>
+                                    <li>Higher values (140-200): Fewer sentences, slower processing, may impact quality for very long sentences</li>
+                                </ul>
+                            </li>
+                            <li><strong>Example usage:</strong>
+                                <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px; margin-top: 10px; overflow-x: auto;"><code>{
+  "text": "This is a long text that will be split into manageable chunks for processing.",
+  "name": "speaker1",
+  "max_text_tokens_per_sentence": 120,
+  "response_format": "mp3"
+}</code></pre>
+                            </li>
+                        </ul>
+                        
+                        <hr style="margin: 20px 0; border: none; border-top: 2px solid #f0f0f0;">
+                        
+                        <h4>📊 Complete Endpoint Summary</h4>
+                        <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
+                            <thead>
+                                <tr style="background: #f5f5f5;">
+                                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Method</th>
+                                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Endpoint</th>
+                                    <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Purpose</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">GET</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">This web interface</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">GET</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/server_info</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">Server & model information</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">GET</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/audio_roles</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">List speakers</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/add_speaker</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">Add speaker preset</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/delete_speaker</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">Remove speaker preset</td>
+                                </tr>
+                                <tr style="background: #f9f9ff;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/speak</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Generate speech (standard)</strong></td>
+                                </tr>
+                                <tr style="background: #f9f9ff;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/clone_voice</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>Clone voice (standard)</strong></td>
+                                </tr>
+                                <tr style="background: #fff9f0;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/speak_stream</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>⚡ Generate speech (streaming)</strong></td>
+                                </tr>
+                                <tr style="background: #fff9f0;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/clone_voice_stream</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><strong>⚡ Clone voice (streaming)</strong></td>
+                                </tr>
+                                <tr style="background: #fff0f0;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/api/estimate_duration</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">Estimate speech length</td>
+                                </tr>
+                                <tr style="background: #fff0f0;">
+                                    <td style="padding: 8px; border: 1px solid #ddd;">POST</td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;"><code>/api/clear_outputs</code></td>
+                                    <td style="padding: 8px; border: 1px solid #ddd;">Clean output files</td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -1513,7 +1519,7 @@ async def home():
                     
                     const formData = new FormData();
                     formData.append('name', speakerName);
-                    formData.append('audio_file', audioFiles[0]); // FlashTTS /add_speaker uses single file
+                    formData.append('audio_file', audioFiles[0]); // /add_speaker uses single file
                     
                     const response = await fetch('/add_speaker', {
                         method: 'POST',
@@ -1545,6 +1551,7 @@ async def home():
                 const emotionText = document.getElementById('emotionText').value;
                 const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
                 const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
+                const maxTextTokens = parseInt(document.getElementById('maxTextTokens').value);
                 const streamingMode = document.getElementById('streamingMode').checked;
                 
                 if (!text.trim()) {
@@ -1557,29 +1564,30 @@ async def home():
                     
                     if (streamingMode) {
                         // Streaming mode
-                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime);
+                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
                     } else {
                         // Regular mode
-                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime);
+                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
                     }
                 } catch (error) {
                     showStatus(`Network error: ${error.message}`, 'error');
                 }
             });
 
-            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime) {
+            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
                     let response;
                     const voiceFiles = document.getElementById('voice_files').files;
                     
                     if (speaker) {
-                        // Use FlashTTS /speak endpoint with speaker preset
+                        // Use /speak endpoint with speaker preset
                         const requestData = {
                             text: text, 
-                            name: speaker,  // FlashTTS uses 'name' not 'speaker'
+                            name: speaker,  // API uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             diffusion_steps: diffusionSteps,
+                            max_text_tokens_per_sentence: maxTextTokens,
                             response_format: "mp3"
                         };
                         
@@ -1589,7 +1597,7 @@ async def home():
                             body: JSON.stringify(requestData)
                         });
                     } else if (voiceFiles && voiceFiles.length > 0) {
-                        // Use FlashTTS /clone_voice endpoint with uploaded voice file
+                        // Use /clone_voice endpoint with uploaded voice file
                         const cloneFormData = new FormData();
                         cloneFormData.append('text', text);
                         cloneFormData.append('reference_audio_file', voiceFiles[0]);
@@ -1597,6 +1605,7 @@ async def home():
                         cloneFormData.append('emotion_weight', emotionWeight.toString());
                         cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                         cloneFormData.append('diffusion_steps', diffusionSteps.toString());
+                        cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
                         cloneFormData.append('response_format', 'mp3');
                         
                         response = await fetch('/clone_voice', {
@@ -1635,7 +1644,7 @@ async def home():
                     }
             }
 
-            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, formData, startTime) {
+            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
                 showStatus('⚡ Streaming: Waiting for first chunk...', 'success');
                 
                 // Get first chunk size setting
@@ -1646,23 +1655,24 @@ async def home():
                 const voiceFiles = document.getElementById('voice_files').files;
                 
                 if (speaker) {
-                    // Use FlashTTS /speak_stream endpoint with speaker preset
+                    // Use /speak_stream endpoint with speaker preset
                     endpoint = '/speak_stream';
                     requestOptions = {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             text: text,
-                            name: speaker,  // FlashTTS uses 'name' not 'speaker'
+                            name: speaker,  // API uses 'name' not 'speaker'
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             diffusion_steps: diffusionSteps,
+                            max_text_tokens_per_sentence: maxTextTokens,
                             response_format: "mp3"
                         })
                     };
                 } else if (voiceFiles && voiceFiles.length > 0) {
-                    // Use FlashTTS /clone_voice_stream endpoint with uploaded voice file
+                    // Use /clone_voice_stream endpoint with uploaded voice file
                     endpoint = '/clone_voice_stream';
                     const cloneFormData = new FormData();
                     cloneFormData.append('text', text);
@@ -1671,6 +1681,7 @@ async def home():
                     cloneFormData.append('emotion_weight', emotionWeight.toString());
                     cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                     cloneFormData.append('diffusion_steps', diffusionSteps.toString());
+                    cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
                     cloneFormData.append('response_format', 'mp3');
                     requestOptions = {
                         method: 'POST',
@@ -1972,17 +1983,26 @@ async def api_clear_outputs():
         total_size = 0
         
         # Remove all files in outputs directory and subdirectories
-        for root, dirs, files in os.walk(outputs_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                try:
-                    file_size = os.path.getsize(file_path)
-                    os.remove(file_path)
-                    files_deleted += 1
-                    total_size += file_size
-                    print(f"🗑️ Deleted: {file_path}")
-                except Exception as e:
-                    print(f"⚠️ Failed to delete {file_path}: {e}")
+        # Run file deletion in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def delete_files_sync():
+            deleted = 0
+            size = 0
+            for root, dirs, files in os.walk(outputs_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        os.remove(file_path)
+                        deleted += 1
+                        size += file_size
+                        print(f"🗑️ Deleted: {file_path}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to delete {file_path}: {e}")
+            return deleted, size
+        
+        files_deleted, total_size = await loop.run_in_executor(executor, delete_files_sync)
         
         space_freed_mb = total_size / (1024 * 1024)
         
@@ -2001,7 +2021,7 @@ async def api_clear_outputs():
             "message": f"Failed to clear outputs: {str(e)}"
         }
 
-# FlashTTS API Helper Functions (matching deploy_vllm_indextts.py exactly)
+# API Helper Functions (matching deploy_vllm_indextts.py exactly)
 async def get_audio_bytes_from_url(url: str) -> bytes:
     """Download audio from URL"""
     try:
@@ -2012,14 +2032,22 @@ async def get_audio_bytes_from_url(url: str) -> bytes:
                 raise HTTPException(status_code=400, detail="Cannot download audio from URL")
             return response.content
     except ImportError:
-        # Fallback if httpx is not available
+        # Fallback if httpx is not available - run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def download_sync():
+            try:
+                with urllib.request.urlopen(url) as response:
+                    if response.status != 200:
+                        raise Exception("Cannot download audio from URL")
+                    return response.read()
+            except Exception as e:
+                raise Exception(f"Failed to download audio: {str(e)}")
+        
         try:
-            with urllib.request.urlopen(url) as response:
-                if response.status != 200:
-                    raise HTTPException(status_code=400, detail="Cannot download audio from URL")
-                return response.read()
+            return await loop.run_in_executor(executor, download_sync)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e))
 
 async def load_base64_or_url(audio: str) -> BytesIO:
     """Load audio from base64 or URL"""
@@ -2033,7 +2061,7 @@ async def load_base64_or_url(audio: str) -> BytesIO:
     
     return BytesIO(audio_bytes)
 
-async def load_audio_bytes_flashtts(audio_file, audio):
+async def load_audio_bytes_from_request(audio_file, audio):
     """Load audio bytes from file or reference audio string"""
     if audio_file is None:
         if audio is None:
@@ -2045,18 +2073,18 @@ async def load_audio_bytes_flashtts(audio_file, audio):
             raise HTTPException(status_code=400, detail="Reference audio file is empty")
         return BytesIO(content)
 
-# FlashTTS API Compatibility Endpoints
+# API Compatibility Endpoints
 @app.post("/add_speaker")
-async def flashtts_add_speaker(
+async def add_speaker(
     background_tasks: BackgroundTasks,
     name: str = Form(..., description="The name of the speaker"),
     audio: Optional[str] = Form(None, description="Reference audio URL or base64"),
     reference_text: Optional[str] = Form(None, description="Optional transcript"),
     audio_file: Optional[UploadFile] = File(None, description="Upload reference audio file"),
 ):
-    """FlashTTS API: Add a new speaker"""
+    """API: Add a new speaker"""
     try:
-        print(f"🎭 FlashTTS API: Adding speaker '{name}'")
+        print(f"🎭 API: Adding speaker '{name}'")
         print(f"🔍 Debug: audio_file={audio_file}, audio={audio is not None}, reference_text={reference_text}")
         
         if not speaker_api:
@@ -2067,15 +2095,15 @@ async def flashtts_add_speaker(
         
         # Load audio from file or reference string (matching deploy_vllm_indextts.py)
         try:
-            audio_io = await load_audio_bytes_flashtts(audio_file, audio)
+            audio_io = await load_audio_bytes_from_request(audio_file, audio)
             if audio_io is None:
-                print(f"❌ FlashTTS API: No audio provided for speaker '{name}'")
+                print(f"❌ API: No audio provided for speaker '{name}'")
                 return JSONResponse(
                     status_code=400,
                     content={"success": False, "error": "No audio provided"}
                 )
         except Exception as audio_error:
-            print(f"❌ FlashTTS API: Audio loading failed for speaker '{name}': {audio_error}")
+            print(f"❌ API: Audio loading failed for speaker '{name}': {audio_error}")
             return JSONResponse(
                 status_code=400,
                 content={"success": False, "error": f"Audio loading failed: {str(audio_error)}"}
@@ -2088,7 +2116,7 @@ async def flashtts_add_speaker(
         # Save to temporary file and smart cut at silence intervals
         temp_dir = Path("speaker_presets") / "temp"
         temp_dir.mkdir(exist_ok=True)
-        temp_path = temp_dir / f"flashtts_{name}_{filename}"
+        temp_path = temp_dir / f"speaker_{name}_{filename}"
         
         try:
             await async_write_file(str(temp_path), audio_data)
@@ -2102,12 +2130,12 @@ async def flashtts_add_speaker(
             result = await speaker_api.add_speaker(name, [cut_audio_data], [filename])
             
         finally:
-            # Clean up temporary files
+            # Clean up temporary files asynchronously
             try:
                 if temp_path.exists():
-                    temp_path.unlink()
+                    await async_remove_file(str(temp_path))
                 if cut_temp_path != str(temp_path) and os.path.exists(cut_temp_path):
-                    os.remove(cut_temp_path)
+                    await async_remove_file(cut_temp_path)
             except:
                 pass
         
@@ -2121,20 +2149,20 @@ async def flashtts_add_speaker(
             
     except Exception as e:
         error_msg = f"Failed to add speaker '{name}': {str(e)}"
-        print(f"❌ FlashTTS API: {error_msg}")
+        print(f"❌ API: {error_msg}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": error_msg}
         )
 
 @app.post("/delete_speaker")
-async def flashtts_delete_speaker(
+async def delete_speaker(
     background_tasks: BackgroundTasks,
     name: str = Form(..., description="The name of the speaker")
 ):
-    """FlashTTS API: Delete a speaker"""
+    """API: Delete a speaker"""
     try:
-        print(f"🗑️ FlashTTS API: Deleting speaker '{name}'")
+        print(f"🗑️ API: Deleting speaker '{name}'")
         
         if not speaker_api:
             return JSONResponse(
@@ -2154,17 +2182,17 @@ async def flashtts_delete_speaker(
             
     except Exception as e:
         error_msg = f"Failed to delete speaker '{name}': {str(e)}"
-        print(f"❌ FlashTTS API: {error_msg}")
+        print(f"❌ API: {error_msg}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": error_msg}
         )
 
 @app.get("/audio_roles")
-async def flashtts_audio_roles():
-    """FlashTTS API: List available speakers"""
+async def audio_roles():
+    """API: List available speakers"""
     try:
-        print("📋 FlashTTS API: Listing audio roles")
+        print("📋 API: Listing audio roles")
         
         if not speaker_api:
             return JSONResponse(content={"success": False, "roles": []})
@@ -2179,17 +2207,17 @@ async def flashtts_audio_roles():
             
     except Exception as e:
         error_msg = f"Failed to list audio roles: {str(e)}"
-        print(f"❌ FlashTTS API: {error_msg}")
+        print(f"❌ API: {error_msg}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": error_msg}
         )
 
 @app.post("/speak")
-async def flashtts_speak(req: SpeakRequest):
-    """FlashTTS API: Generate speech using registered speaker"""
+async def speak(req: SpeakRequest):
+    """API: Generate speech using registered speaker"""
     try:
-        print(f"🎭 FlashTTS API: Speaking with '{req.name}' - '{req.text[:50]}...'")
+        print(f"🎭 API: Speaking with '{req.name}' - '{req.text[:50]}...'")
         
         if not req.name:
             return JSONResponse(
@@ -2225,6 +2253,7 @@ async def flashtts_speak(req: SpeakRequest):
             emo_alpha=req.emotion_weight,
             speech_length=req.speech_length,
             diffusion_steps=req.diffusion_steps,
+            max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
             verbose=cmd_args.verbose
         )
         
@@ -2252,7 +2281,7 @@ async def flashtts_speak(req: SpeakRequest):
         }
         content_type = content_type_map.get(req.response_format, f"audio/{req.response_format}")
         
-        print(f"✅ FlashTTS API: Generated {len(audio_bytes)} bytes of {req.response_format.upper()} audio")
+        print(f"✅ API: Generated {len(audio_bytes)} bytes of {req.response_format.upper()} audio")
         
         # Cleanup temporary file
         await async_remove_file(result)
@@ -2270,7 +2299,7 @@ async def flashtts_speak(req: SpeakRequest):
     except Exception as e:
         import traceback
         error_msg = f"Voice synthesis failed: {str(e)}"
-        print(f"❌ FlashTTS API: {error_msg}")
+        print(f"❌ API: {error_msg}")
         print(f"🔍 Full traceback:")
         traceback.print_exc()
         return JSONResponse(
@@ -2296,6 +2325,7 @@ def parse_clone_form(
     emotion_text: Optional[str] = Form(""),
     emotion_weight: float = Form(0.6),
     diffusion_steps: int = Form(10),
+    max_text_tokens_per_sentence: int = Form(120),
 ):
     return CloneRequest(
         text=text, reference_audio=reference_audio, reference_text=reference_text,
@@ -2304,20 +2334,20 @@ def parse_clone_form(
         length_threshold=length_threshold, window_size=window_size,
         stream=stream, response_format=response_format,
         emotion_text=emotion_text, emotion_weight=emotion_weight,
-        diffusion_steps=diffusion_steps
+        diffusion_steps=diffusion_steps, max_text_tokens_per_sentence=max_text_tokens_per_sentence
     )
 
 @app.post("/clone_voice")
-async def flashtts_clone_voice(
+async def clone_voice(
     req: CloneRequest = Depends(parse_clone_form),
     reference_audio_file: Optional[UploadFile] = File(None),
 ):
-    """FlashTTS API: Clone voice using reference audio"""
+    """API: Clone voice using reference audio"""
     try:
-        print(f"🎵 FlashTTS API: Cloning voice - '{req.text[:50]}...'")
+        print(f"🎵 API: Cloning voice - '{req.text[:50]}...'")
         
         # Load reference audio (matching deploy_vllm_indextts.py)
-        audio_io = await load_audio_bytes_flashtts(reference_audio_file, req.reference_audio)
+        audio_io = await load_audio_bytes_from_request(reference_audio_file, req.reference_audio)
         if audio_io is None:
             return JSONResponse(
                 status_code=400,
@@ -2348,6 +2378,7 @@ async def flashtts_clone_voice(
                 emo_alpha=req.emotion_weight,
                 speech_length=req.speech_length,
                 diffusion_steps=req.diffusion_steps,
+                max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                 verbose=cmd_args.verbose
             )
             
@@ -2375,7 +2406,7 @@ async def flashtts_clone_voice(
             }
             content_type = content_type_map.get(req.response_format, f"audio/{req.response_format}")
             
-            print(f"✅ FlashTTS API: Cloned voice - {len(audio_bytes)} bytes of {req.response_format.upper()}")
+            print(f"✅ API: Cloned voice - {len(audio_bytes)} bytes of {req.response_format.upper()}")
             
             # Cleanup temporary file
             await async_remove_file(result)
@@ -2395,15 +2426,15 @@ async def flashtts_clone_voice(
                 
     except Exception as e:
         error_msg = f"Failed to clone voice: {str(e)}"
-        print(f"❌ FlashTTS API: {error_msg}")
+        print(f"❌ API: {error_msg}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": error_msg}
         )
 
 @app.get("/server_info")
-async def flashtts_server_info():
-    """FlashTTS API: Get server information"""
+async def server_info():
+    """API: Get server information"""
     try:
         if not speaker_api:
             roles = []
@@ -2434,12 +2465,12 @@ async def flashtts_server_info():
         )
 
 @app.post("/speak_stream")
-async def flashtts_speak_stream(req: SpeakRequest):
-    """FlashTTS API: Generate speech using registered speaker with streaming"""
+async def speak_stream(req: SpeakRequest):
+    """API: Generate speech using registered speaker with streaming"""
     from fastapi.responses import StreamingResponse
     
     try:
-        print(f"🎭 FlashTTS API Streaming: Speaking with '{req.name}' - '{req.text[:50]}...'")
+        print(f"🎭 API Streaming: Speaking with '{req.name}' - '{req.text[:50]}...'")
         
         if not req.name:
             return JSONResponse(
@@ -2475,6 +2506,7 @@ async def flashtts_speak_stream(req: SpeakRequest):
                     emo_alpha=req.emotion_weight,
                     speech_length=req.speech_length,
                     diffusion_steps=req.diffusion_steps,
+                    max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
@@ -2522,7 +2554,7 @@ async def flashtts_speak_stream(req: SpeakRequest):
     except Exception as e:
         import traceback
         error_msg = f"Voice synthesis streaming failed: {str(e)}"
-        print(f"❌ FlashTTS API Streaming: {error_msg}")
+        print(f"❌ API Streaming: {error_msg}")
         print(f"🔍 Full traceback:")
         traceback.print_exc()
         return JSONResponse(
@@ -2531,18 +2563,18 @@ async def flashtts_speak_stream(req: SpeakRequest):
         )
 
 @app.post("/clone_voice_stream")
-async def flashtts_clone_voice_stream(
+async def clone_voice_stream(
     req: CloneRequest = Depends(parse_clone_form),
     reference_audio_file: Optional[UploadFile] = File(None),
 ):
-    """FlashTTS API: Clone voice using reference audio with streaming"""
+    """API: Clone voice using reference audio with streaming"""
     from fastapi.responses import StreamingResponse
     
     try:
-        print(f"🎵 FlashTTS API Streaming: Cloning voice - '{req.text[:50]}...'")
+        print(f"🎵 API Streaming: Cloning voice - '{req.text[:50]}...'")
         
         # Load reference audio (matching deploy_vllm_indextts.py)
-        audio_io = await load_audio_bytes_flashtts(reference_audio_file, req.reference_audio)
+        audio_io = await load_audio_bytes_from_request(reference_audio_file, req.reference_audio)
         if audio_io is None:
             return JSONResponse(
                 status_code=400,
@@ -2572,6 +2604,7 @@ async def flashtts_clone_voice_stream(
                     emo_alpha=req.emotion_weight,
                     speech_length=req.speech_length,
                     diffusion_steps=req.diffusion_steps,
+                    max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                     first_chunk_max_tokens=40,  # Default first chunk size
                     verbose=cmd_args.verbose
                 ):
@@ -2621,7 +2654,7 @@ async def flashtts_clone_voice_stream(
                 
     except Exception as e:
         error_msg = f"Failed to clone voice with streaming: {str(e)}"
-        print(f"❌ FlashTTS API Streaming: {error_msg}")
+        print(f"❌ API Streaming: {error_msg}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": error_msg}
@@ -2639,7 +2672,7 @@ if __name__ == "__main__":
     print(f"💡 Features:")
     print(f"   - IndexTTS vLLM v2 backend for ultra-fast inference")
     print(f"   - Speaker preset management with persistent storage")
-    print(f"   - FlashTTS API compatibility")
+    print(f"   - API compatibility for external integrations")
     print(f"   - Modern web interface with Chinese support")
     print(f"   - MP3 output for smaller file sizes")
     print(f"   - High concurrency support (100 concurrent connections)")
