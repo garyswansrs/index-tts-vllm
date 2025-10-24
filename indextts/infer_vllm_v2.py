@@ -50,7 +50,7 @@ import hashlib
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10, use_torch_compile=True
     ):
         """
         Args:
@@ -58,8 +58,9 @@ class IndexTTS2:
             model_dir (str): path to the model directory.
             is_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
-            use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device (default: None, which enables it automatically on CUDA).
             qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.10).
+            use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: True). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
         """
         if device is not None:
             self.device = device
@@ -84,6 +85,7 @@ class IndexTTS2:
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.is_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
+        self.use_torch_compile = use_torch_compile
 
         vllm_dir = os.path.join(model_dir, "gpt")
         engine_args = AsyncEngineArgs(
@@ -164,6 +166,12 @@ class IndexTTS2:
         # Ensure no gradients are tracked for concurrent inference
         for param in self.s2mel.parameters():
             param.requires_grad = False
+        
+        # Enable torch.compile optimization if requested
+        if self.use_torch_compile:
+            print(">> Enabling torch.compile optimization for s2mel...")
+            self.s2mel.enable_torch_compile()
+        
         print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
