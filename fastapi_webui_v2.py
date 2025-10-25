@@ -470,8 +470,10 @@ class SpeakerAPIWrapper:
     async def add_speaker(self, speaker_name: str, audio_files: List[bytes], filenames: List[str]) -> Dict[str, str]:
         """Add a new speaker with audio files"""
         try:
-            # Check if speaker already exists
-            existing_presets = self.preset_manager.list_presets()
+            # Check if speaker already exists - run in thread pool
+            loop = asyncio.get_event_loop()
+            existing_presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
+            
             if speaker_name in existing_presets:
                 preset_info = existing_presets[speaker_name]
                 return {
@@ -493,7 +495,8 @@ class SpeakerAPIWrapper:
             
             # Save to temporary location
             temp_dir = Path("speaker_presets") / "temp"
-            temp_dir.mkdir(exist_ok=True)
+            # Create directory in thread pool to avoid blocking
+            await loop.run_in_executor(executor, temp_dir.mkdir, True, True)
             
             temp_path = temp_dir / f"{speaker_name}_{filename}"
             await async_write_file(str(temp_path), audio_data)
@@ -502,11 +505,14 @@ class SpeakerAPIWrapper:
                 # Cut audio to 10 seconds if it exceeds the limit
                 cut_temp_path = await async_cut_audio_to_duration(str(temp_path), max_duration=10.0)
                 
-                # Use SpeakerPresetManager to add the speaker
-                success = self.preset_manager.add_speaker_preset(
-                    preset_name=speaker_name,
-                    audio_path=cut_temp_path,
-                    description=f"Added via API with {len(audio_files)} audio files (auto-cut to 10s)"
+                # Use SpeakerPresetManager to add the speaker - run in thread pool to avoid blocking
+                # This operation processes audio through TTS pipeline and can take several seconds
+                success = await loop.run_in_executor(
+                    executor,
+                    self.preset_manager.add_speaker_preset,
+                    speaker_name,
+                    cut_temp_path,
+                    f"Added via API with {len(audio_files)} audio files (auto-cut to 10s)"
                 )
                 
                 if success:
@@ -523,11 +529,14 @@ class SpeakerAPIWrapper:
                 # Clean up temporary files asynchronously
                 try:
                     # Clean up original temp file (if different from cut file)
-                    if temp_path.exists():
+                    temp_exists = await loop.run_in_executor(executor, temp_path.exists)
+                    if temp_exists:
                         await async_remove_file(str(temp_path))
                     # Clean up cut file if it's different and exists
-                    if cut_temp_path != str(temp_path) and os.path.exists(cut_temp_path):
-                        await async_remove_file(cut_temp_path)
+                    if cut_temp_path != str(temp_path):
+                        cut_exists = await loop.run_in_executor(executor, os.path.exists, cut_temp_path)
+                        if cut_exists:
+                            await async_remove_file(cut_temp_path)
                 except:
                     pass
             
@@ -537,7 +546,9 @@ class SpeakerAPIWrapper:
     async def delete_speaker(self, speaker_name: str) -> Dict[str, str]:
         """Delete a speaker"""
         try:
-            success = self.preset_manager.delete_preset(speaker_name)
+            # Run deletion in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(executor, self.preset_manager.delete_preset, speaker_name)
             
             if success:
                 return {
@@ -553,15 +564,21 @@ class SpeakerAPIWrapper:
     async def list_speakers(self) -> Dict[str, any]:
         """List all speakers with metadata"""
         try:
-            presets = self.preset_manager.list_presets()
+            # Run the synchronous operation in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
             
             speaker_info = {}
             for speaker_name, preset_data in presets.items():
-                # Calculate cache file size
+                # Calculate cache file size in thread pool to avoid blocking
                 cache_file = preset_data.get('cache_file', '')
                 total_size = 0
-                if cache_file and os.path.exists(cache_file):
-                    total_size = os.path.getsize(cache_file)
+                if cache_file:
+                    def get_file_size(filepath):
+                        if os.path.exists(filepath):
+                            return os.path.getsize(filepath)
+                        return 0
+                    total_size = await loop.run_in_executor(executor, get_file_size, cache_file)
                 
                 speaker_info[speaker_name] = {
                     "audio_count": 1,  # SpeakerPresetManager uses single audio file
@@ -584,11 +601,17 @@ class SpeakerAPIWrapper:
     async def get_speaker_audio_paths(self, speaker_name: str) -> Optional[List[str]]:
         """Get audio paths for a specific speaker"""
         try:
-            presets = self.preset_manager.list_presets()
+            # Run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
+            
             if speaker_name in presets:
                 audio_path = presets[speaker_name].get('audio_path', '')
-                if audio_path and os.path.exists(audio_path):
-                    return [audio_path]
+                if audio_path:
+                    # Check file existence in thread pool
+                    exists = await loop.run_in_executor(executor, os.path.exists, audio_path)
+                    if exists:
+                        return [audio_path]
             return None
         except Exception as e:
             print(f"Error getting speaker audio paths: {e}")
@@ -648,6 +671,97 @@ class SpeakRequest(BaseModel):
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
 
+async def warmup_model():
+    """Run warmup inferences to fully preload the model"""
+    try:
+        print("🔥 Running model warmup (2 inferences for full load)...")
+        tts = tts_manager.get_tts()
+        
+        # First warmup inference
+        warmup_audio_1 = os.path.join(current_dir, "examples", "voice_01.wav")
+        warmup_text_1 = "你好！欢迎使用IndexTTS中文语音合成系统。这是一个功能强大的AI语音生成工具，能够准确处理中文语音合成任务。系统支持多种语音风格，让您的文本转换为自然流畅的语音。"
+        
+        # Check if first warmup audio exists
+        if not os.path.exists(warmup_audio_1):
+            print(f"⚠️ Warmup audio file not found: {warmup_audio_1}")
+            return
+        
+        # Create temporary output file for first warmup
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            warmup_output_1 = tmp_file.name
+        
+        try:
+            # Run first warmup inference
+            print("🔥 Warmup 1/2: Modern text with voice_01.wav...")
+            await tts.infer(
+                spk_audio_prompt=warmup_audio_1,
+                text=warmup_text_1,
+                output_path=warmup_output_1,
+                emo_audio_prompt=None,
+                emo_alpha=0.6,
+                emo_vector=None,
+                use_emo_text=True,
+                emo_text="兴奋",
+                use_random=False,
+                interval_silence=200,
+                verbose=False,
+                max_text_tokens_per_sentence=120,
+                speaker_preset=None,
+                speech_length=0,
+                diffusion_steps=10
+            )
+            print("✅ Warmup 1/2 completed!")
+        finally:
+            # Clean up first temporary warmup file
+            if os.path.exists(warmup_output_1):
+                os.remove(warmup_output_1)
+        
+        # Second warmup inference
+        warmup_audio_2 = os.path.join(current_dir, "examples", "voice_02.wav")
+        warmup_text_2 = "床前明月光，疑是地上霜。举头望明月，低头思故乡。这首《静夜思》是李白的名作，表达了诗人对故乡的深深思念之情。"
+        
+        # Check if second warmup audio exists
+        if not os.path.exists(warmup_audio_2):
+            print(f"⚠️ Warmup audio file not found: {warmup_audio_2}")
+            print("✅ Model warmup completed with 1/2 inferences")
+            return
+        
+        # Create temporary output file for second warmup
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            warmup_output_2 = tmp_file.name
+        
+        try:
+            # Run second warmup inference
+            print("🔥 Warmup 2/2: Ancient poetry with voice_02.wav...")
+            await tts.infer(
+                spk_audio_prompt=warmup_audio_2,
+                text=warmup_text_2,
+                output_path=warmup_output_2,
+                emo_audio_prompt=None,
+                emo_alpha=0.6,
+                emo_vector=None,
+                use_emo_text=True,
+                emo_text="兴奋",
+                use_random=False,
+                interval_silence=200,
+                verbose=False,
+                max_text_tokens_per_sentence=120,
+                speaker_preset=None,
+                speech_length=0,
+                diffusion_steps=10
+            )
+            print("✅ Warmup 2/2 completed!")
+        finally:
+            # Clean up second temporary warmup file
+            if os.path.exists(warmup_output_2):
+                os.remove(warmup_output_2)
+        
+        print("✅ Model warmup fully completed (2/2 inferences)!")
+                
+    except Exception as e:
+        print(f"⚠️ Warmup failed (non-critical): {e}")
+        traceback.print_exc()
+
 # FastAPI lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -655,6 +769,10 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Starting IndexTTS vLLM v2 FastAPI WebUI...")
     await tts_manager.initialize()
+    
+    # Run warmup inference
+    await warmup_model()
+    
     yield
     # Shutdown (if needed)
     print("🔄 Shutting down IndexTTS vLLM v2...")
