@@ -496,7 +496,7 @@ class SpeakerAPIWrapper:
             # Save to temporary location
             temp_dir = Path("speaker_presets") / "temp"
             # Create directory in thread pool to avoid blocking
-            await loop.run_in_executor(executor, temp_dir.mkdir, True, True)
+            await loop.run_in_executor(executor, lambda: temp_dir.mkdir(parents=True, exist_ok=True))
             
             temp_path = temp_dir / f"{speaker_name}_{filename}"
             await async_write_file(str(temp_path), audio_data)
@@ -679,7 +679,7 @@ async def warmup_model():
         
         # First warmup inference
         warmup_audio_1 = os.path.join(current_dir, "examples", "voice_01.wav")
-        warmup_text_1 = "你好！欢迎使用IndexTTS中文语音合成系统。这是一个功能强大的AI语音生成工具，能够准确处理中文语音合成任务。系统支持多种语音风格，让您的文本转换为自然流畅的语音。"
+        warmup_text_1 = "你好！欢迎使用IndexTTS中文语音合成系统。这是一个功能强大的AI语音生成工具，能够准确处理中文语音合成任务。床前明月光，疑是地上霜。举头望明月，低头思故乡。这首《静夜思》是李白的名作，表达了诗人对故乡的深深思念之情。系统支持多种语音风格，让您的文本转换为自然流畅的语音。今天是2025年1月11日，时间是下午3点30分。这款产品的价格是12,999元，性价比很高。我的电话号码是138-8888-8888，欢迎联系。我正在使用IndexTTS和vLLM技术进行AI语音合成。This system supports both Chinese and English perfectly. 这个系统的RTF约为0.1，比原版快3倍！GPU memory utilization设置为85%。"
         
         # Check if first warmup audio exists
         if not os.path.exists(warmup_audio_1):
@@ -718,7 +718,7 @@ async def warmup_model():
         
         # Second warmup inference
         warmup_audio_2 = os.path.join(current_dir, "examples", "voice_02.wav")
-        warmup_text_2 = "床前明月光，疑是地上霜。举头望明月，低头思故乡。这首《静夜思》是李白的名作，表达了诗人对故乡的深深思念之情。"
+        warmup_text_2 = "人工智能是百年来最宏大的科技建设项目。它究竟是什么样子的？美国经济已经一分为二。一边是热火朝天的 AI 经济，另一边则是萎靡不振的消费经济。你可以在经济统计数据中看到这一点。上个季度，人工智能领域的支出增长超过了消费者支出的增长。如果没有 AI，美国的经济增长将会微不足道。你可以在股市中看到这一点。在过去两年里，股市增长的约 60% 来自与 AI 相关的公司，如微软、英伟达和 Meta。如果没有 AI 热潮，股市的回报率将惨不忍睹。"
         
         # Check if second warmup audio exists
         if not os.path.exists(warmup_audio_2):
@@ -741,7 +741,7 @@ async def warmup_model():
                 emo_alpha=0.6,
                 emo_vector=None,
                 use_emo_text=True,
-                emo_text="兴奋",
+                emo_text="无聊",
                 use_random=False,
                 interval_silence=200,
                 verbose=False,
@@ -2233,7 +2233,7 @@ async def add_speaker(
         
         # Save to temporary file and smart cut at silence intervals
         temp_dir = Path("speaker_presets") / "temp"
-        temp_dir.mkdir(exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
         temp_path = temp_dir / f"speaker_{name}_{filename}"
         
         try:
