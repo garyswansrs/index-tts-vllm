@@ -17,7 +17,7 @@ pip install flashinfer-python
 pip install flash-attn
 sudo apt install ffmpeg
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-python webui_with_presets.py
+python fastapi_webui_v2.py
 ```
 
 ## Project Introduction
