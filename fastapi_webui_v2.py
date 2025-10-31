@@ -19,9 +19,6 @@ import asyncio
 import tempfile
 import traceback
 import uuid
-import time
-import random
-import string
 from pathlib import Path
 from typing import List, Dict, Optional, Literal
 from contextlib import asynccontextmanager
@@ -680,44 +677,86 @@ async def warmup_model():
         print("🔥 Running model warmup (2 inferences for full load)...")
         tts = tts_manager.get_tts()
         
-        # Warmup with simple inference
-        prompt_wav = os.path.join(current_dir, "examples", "voice_01.wav")
+        # First warmup inference
+        warmup_audio_1 = os.path.join(current_dir, "examples", "voice_01.wav")
+        warmup_text_1 = "你好！欢迎使用IndexTTS中文语音合成系统。这是一个功能强大的AI语音生成工具，能够准确处理中文语音合成任务。床前明月光，疑是地上霜。举头望明月，低头思故乡。这首《静夜思》是李白的名作，表达了诗人对故乡的深深思念之情。系统支持多种语音风格，让您的文本转换为自然流畅的语音。今天是2025年1月11日，时间是下午3点30分。这款产品的价格是12,999元，性价比很高。我的电话号码是138-8888-8888，欢迎联系。我正在使用IndexTTS和vLLM技术进行AI语音合成。This system supports both Chinese and English perfectly. 这个系统的RTF约为0.1，比原版快3倍！GPU memory utilization设置为85%。"
         
-        # Check if warmup audio exists
-        if not os.path.exists(prompt_wav):
-            print(f"⚠️ Warmup audio file not found: {prompt_wav}")
+        # Check if first warmup audio exists
+        if not os.path.exists(warmup_audio_1):
+            print(f"⚠️ Warmup audio file not found: {warmup_audio_1}")
             return
         
-        # Create temporary output file for warmup
+        # Create temporary output file for first warmup
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            warmup_output = tmp_file.name
+            warmup_output_1 = tmp_file.name
         
         try:
-            # Initial warmup inference
-            warmup_text = '欢迎大家来体验indextts2，并给予我们意见与反馈，谢谢大家。'
-            print("🔥 Initial warmup inference...")
-            await tts.infer(spk_audio_prompt=prompt_wav, text=warmup_text, output_path=warmup_output)
-            print("✅ Initial warmup completed!")
-            
-            # Run multiple small warmup inferences to stabilize performance
-            char_size = 5
-            time_buckets = []
-            
-            print("🔥 Running performance warmup iterations...")
-            for i in range(10):
-                text = ''.join(random.choices(string.ascii_letters, k=char_size))
-                start_time = time.time()
-                await tts.infer(spk_audio_prompt=prompt_wav, text=text, output_path=warmup_output, verbose=False)
-                elapsed = time.time() - start_time
-                time_buckets.append(elapsed)
-            
-            print(f"⏱️ Warmup iteration times: {[f'{t:.3f}s' for t in time_buckets]}")
-            print(f"⏱️ Average warmup time: {sum(time_buckets)/len(time_buckets):.3f}s")
-            print("✅ Model warmup fully completed!")
+            # Run first warmup inference
+            print("🔥 Warmup 1/2: Modern text with voice_01.wav...")
+            await tts.infer(
+                spk_audio_prompt=warmup_audio_1,
+                text=warmup_text_1,
+                output_path=warmup_output_1,
+                emo_audio_prompt=None,
+                emo_alpha=0.6,
+                emo_vector=None,
+                use_emo_text=True,
+                emo_text="兴奋",
+                use_random=False,
+                interval_silence=200,
+                verbose=False,
+                max_text_tokens_per_sentence=120,
+                speaker_preset=None,
+                speech_length=0,
+                diffusion_steps=10
+            )
+            print("✅ Warmup 1/2 completed!")
         finally:
-            # Clean up temporary warmup file
-            if os.path.exists(warmup_output):
-                os.remove(warmup_output)
+            # Clean up first temporary warmup file
+            if os.path.exists(warmup_output_1):
+                os.remove(warmup_output_1)
+        
+        # Second warmup inference
+        warmup_audio_2 = os.path.join(current_dir, "examples", "voice_02.wav")
+        warmup_text_2 = "人工智能是百年来最宏大的科技建设项目。它究竟是什么样子的？美国经济已经一分为二。一边是热火朝天的 AI 经济，另一边则是萎靡不振的消费经济。你可以在经济统计数据中看到这一点。上个季度，人工智能领域的支出增长超过了消费者支出的增长。如果没有 AI，美国的经济增长将会微不足道。你可以在股市中看到这一点。在过去两年里，股市增长的约 60% 来自与 AI 相关的公司，如微软、英伟达和 Meta。如果没有 AI 热潮，股市的回报率将惨不忍睹。"
+        
+        # Check if second warmup audio exists
+        if not os.path.exists(warmup_audio_2):
+            print(f"⚠️ Warmup audio file not found: {warmup_audio_2}")
+            print("✅ Model warmup completed with 1/2 inferences")
+            return
+        
+        # Create temporary output file for second warmup
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            warmup_output_2 = tmp_file.name
+        
+        try:
+            # Run second warmup inference
+            print("🔥 Warmup 2/2: Ancient poetry with voice_02.wav...")
+            await tts.infer(
+                spk_audio_prompt=warmup_audio_2,
+                text=warmup_text_2,
+                output_path=warmup_output_2,
+                emo_audio_prompt=None,
+                emo_alpha=0.6,
+                emo_vector=None,
+                use_emo_text=True,
+                emo_text="无聊",
+                use_random=False,
+                interval_silence=200,
+                verbose=False,
+                max_text_tokens_per_sentence=120,
+                speaker_preset=None,
+                speech_length=0,
+                diffusion_steps=10
+            )
+            print("✅ Warmup 2/2 completed!")
+        finally:
+            # Clean up second temporary warmup file
+            if os.path.exists(warmup_output_2):
+                os.remove(warmup_output_2)
+        
+        print("✅ Model warmup fully completed (2/2 inferences)!")
                 
     except Exception as e:
         print(f"⚠️ Warmup failed (non-critical): {e}")
