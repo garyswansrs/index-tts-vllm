@@ -50,7 +50,7 @@ import hashlib
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10, use_torch_compile=True
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10, use_torch_compile=False
     ):
         """
         Args:
