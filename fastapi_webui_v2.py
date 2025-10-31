@@ -116,6 +116,7 @@ parser.add_argument("--port", type=int, default=8000, help="Port to run the web 
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web API on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
+parser.add_argument("--use_torch_compile", action="store_true", default=False, help="use torch compile")
 parser.add_argument("--gpu_memory_utilization", type=float, default=0.25, help="GPU memory utilization")
 
 # Parse args if run as script, otherwise use defaults
@@ -129,6 +130,7 @@ except SystemExit:
         host="0.0.0.0",
         model_dir="checkpoints",
         is_fp16=False,
+        use_torch_compile=False,
         gpu_memory_utilization=0.25
     )
 
@@ -426,6 +428,7 @@ class TTSManager:
                 self.tts = IndexTTS2(
                     model_dir=cmd_args.model_dir,
                     is_fp16=cmd_args.is_fp16,
+                    use_torch_compile=cmd_args.use_torch_compile,
                     gpu_memory_utilization=cmd_args.gpu_memory_utilization
                 )
                 
