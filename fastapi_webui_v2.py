@@ -257,7 +257,7 @@ def _detect_silence_intervals(audio_data, sample_rate, min_silence_duration=0.3,
 def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
     """
     Smart audio cutting that uses silence intervals as natural cut points.
-    Tries to find a segment between 3s and 15s that ends at a silence.
+    Tries to find a segment between 3s and max_duration that ends at a silence.
     
     Args:
         input_path: Path to input audio file
@@ -277,9 +277,9 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
             print(f"📏 Audio duration ({total_duration:.1f}s) is too short, keeping original")
             return input_path
         
-        # If audio is between 3s and 15s, return original
-        if total_duration <= 15.0:
-            print(f"📏 Audio duration ({total_duration:.1f}s) is within ideal range (3-15s)")
+        # If audio is between 3s and max_duration, return original
+        if total_duration <= max_duration:
+            print(f"📏 Audio duration ({total_duration:.1f}s) is within ideal range (3.0-{max_duration}s)")
             return input_path
         
         print(f"🔍 Analyzing audio ({total_duration:.1f}s) for silence intervals...")
@@ -288,7 +288,7 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         silence_intervals = _detect_silence_intervals(audio_data, sample_rate)
         
         if not silence_intervals:
-            print(f"⚠️ No silence intervals found, cutting at 10 seconds")
+            print(f"⚠️ No silence intervals found, cutting at {max_duration} seconds")
             cut_sample = int(10.0 * sample_rate)
             cut_audio = audio_data[:cut_sample]
         else:
@@ -302,8 +302,8 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
                 cut_sample = (start_silence + end_silence) // 2
                 cut_duration = cut_sample / sample_rate
                 
-                # Check if this cut point gives us a good duration (3s to 15s)
-                if 3.0 <= cut_duration <= 15.0:
+                # Check if this cut point gives us a good duration (3s to max_duration)
+                if 3.0 <= cut_duration <= max_duration:
                     best_cut_sample = cut_sample
                     print(f"✓ Found ideal cut point at {cut_duration:.1f}s (at silence interval)")
                     break
