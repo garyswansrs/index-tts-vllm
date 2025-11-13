@@ -24,6 +24,9 @@ from typing import Any, List, Dict, Optional, Literal, Tuple, Set
 from contextlib import asynccontextmanager
 from io import BytesIO
 import base64
+import functools
+import json
+import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,6 +40,13 @@ try:
     from clearvoice import ClearVoice  # type: ignore[import]
 except ImportError:
     ClearVoice = None
+
+try:
+    from google import genai  # type: ignore[import]
+    from google.genai import types  # type: ignore[import]
+except ImportError:
+    genai = None
+    types = None
 
 
 # FastAPI and web interface
@@ -57,6 +67,45 @@ import argparse
 
 # Global thread executor for blocking operations
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fastapi_async")
+
+# Gemini configuration
+GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
+GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
+GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
+DEFAULT_GEMINI_MODEL_NAME = "gemini-flash-latest"
+JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+TRANSLATION_PROMPT_TEMPLATE = (
+    "You are a professional interpreter. "
+    "Transcribe the speech from the provided audio and translate it into {dest_language} using natural, conversational wording. "
+    "Return a JSON array where each item contains exactly the keys: "
+    "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
+    "\"end\" (same format), "
+    "\"source_text\" (original-language transcript), "
+    "\"translated_text\" (translation in {dest_language}). "
+    "Ensure the timestamps align closely with the audio and split into coherent segments. "
+    "Respond with JSON only—no explanations, markdown, or additional text."
+)
+DEFAULT_GEMINI_TEMPERATURE = 0.2
+DEFAULT_GEMINI_TOP_P = 0.9
+TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
+TRANSLATE_DEFAULT_BITRATE = "192k"
+AUDIO_GENERATION_MARGIN_MS = 20
+TRANSLATION_TTS_CONCURRENCY = 20
+MIN_SPEECH_DURATION_MS = 3000
+MAX_MERGE_INTERVAL_MS = 500
+
+
+@functools.lru_cache(maxsize=4)
+def _create_gemini_client(api_key: str):
+    if genai is None:
+        raise RuntimeError(
+            "The google-genai package is required for translation. Install it with `pip install google-genai`."
+        )
+    return genai.Client(api_key=api_key)
+
+
+def _get_gemini_client(api_key: str):
+    return _create_gemini_client(api_key)
 
 
 def estimate_speech_duration(text: str, language: str = "auto") -> int:
@@ -461,6 +510,776 @@ def _convert_audio_to_format_sync(wav_data, sample_rate, output_format="mp3", bi
             sf.write(wav_buffer, wav_data, sample_rate, format='WAV')
             return wav_buffer.getvalue(), "audio/wav", "wav"
 
+
+# Gemini translation helpers
+def _get_gemini_model_name() -> str:
+    return os.getenv(GEMINI_MODEL_ENV_VAR, DEFAULT_GEMINI_MODEL_NAME)
+
+
+def _strip_code_fences(text: str) -> str:
+    if not text:
+        return ""
+    match = JSON_FENCE_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```"):
+        return text[3:-3].strip()
+    # Fallback: extract JSON array if present
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1].strip()
+    return text
+
+
+def _parse_gemini_json(text: str) -> List[Dict[str, Any]]:
+    cleaned = _strip_code_fences(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise ValueError("Gemini response must be a JSON array of segments.")
+    return data
+
+
+def _extract_text_from_gemini_response(response: Any) -> str:
+    if response is None:
+        return ""
+
+    for attr in ("text", "output_text", "output_texts"):
+        value = getattr(response, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list) and value:
+            concatenated = "\n".join(str(item) for item in value if item)
+            if concatenated.strip():
+                return concatenated.strip()
+
+    parts_text: List[str] = []
+
+    candidates = getattr(response, "candidates", None)
+    if candidates:
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if content is not None:
+                parts = getattr(content, "parts", None)
+                if parts:
+                    for part in parts:
+                        part_text = getattr(part, "text", None)
+                        if isinstance(part_text, str) and part_text.strip():
+                            parts_text.append(part_text.strip())
+            if isinstance(candidate, dict):
+                for part in candidate.get("content", {}).get("parts", []):
+                    part_text = part.get("text")
+                    if isinstance(part_text, str) and part_text.strip():
+                        parts_text.append(part_text.strip())
+
+    if not parts_text:
+        contents = getattr(response, "contents", None)
+        if contents:
+            for content in contents:
+                parts = getattr(content, "parts", None)
+                if parts:
+                    for part in parts:
+                        part_text = getattr(part, "text", None)
+                        if isinstance(part_text, str) and part_text.strip():
+                            parts_text.append(part_text.strip())
+                elif isinstance(content, dict):
+                    for part in content.get("parts", []):
+                        part_text = part.get("text")
+                        if isinstance(part_text, str) and part_text.strip():
+                            parts_text.append(part_text.strip())
+
+    return "\n".join(parts_text).strip()
+
+
+def _parse_timestamp_to_ms(timestamp_value: Any) -> Optional[int]:
+    if timestamp_value is None:
+        return None
+    if isinstance(timestamp_value, (int, float)):
+        # Treat integer millisecond values separately
+        if isinstance(timestamp_value, int) and timestamp_value >= 1000:
+            return max(0, int(timestamp_value))
+        seconds = float(timestamp_value)
+        return max(0, int(round(seconds * 1000)))
+    value = str(timestamp_value).strip()
+    if not value:
+        return None
+    value = value.replace(",", ".")
+    # Try simple numeric parse
+    if re.fullmatch(r"\d+(?:\.\d+)?", value):
+        seconds = float(value)
+        return max(0, int(seconds * 1000))
+    # Handle colon-delimited formats (e.g., hh:mm:ss.xxx or mm:ss)
+    parts = value.split(":")
+    try:
+        parts = [p.strip() for p in parts if p.strip()]
+        if not parts:
+            return None
+        total_seconds = 0.0
+        multiplier = 1.0
+        for part in reversed(parts):
+            if "." in part:
+                seconds = float(part)
+            else:
+                seconds = float(int(part))
+            total_seconds += seconds * multiplier
+            multiplier *= 60.0
+        return max(0, int(round(total_seconds * 1000)))
+    except ValueError:
+        return None
+
+
+def _format_ms_to_timestamp(milliseconds: int) -> str:
+    ms = max(0, int(milliseconds))
+    total_seconds = ms / 1000.0
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = total_seconds % 60
+    if abs(seconds - round(seconds)) < 1e-3:
+        seconds_str = f"{int(round(seconds)):02d}"
+    else:
+        seconds_str = f"{seconds:06.3f}".rstrip("0").rstrip(".")
+        if seconds < 10 and not seconds_str.startswith("0"):
+            seconds_str = "0" + seconds_str
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds_str}"
+    return f"{minutes:02d}:{seconds_str}"
+
+
+def _find_case_insensitive_key(data: Dict[str, Any], candidates: List[str], ignore: Set[str]) -> Optional[str]:
+    lowered = {str(k).lower(): k for k in data.keys()}
+    for candidate in candidates:
+        candidate_lower = candidate.lower()
+        if candidate_lower in lowered:
+            if candidate_lower in ignore:
+                continue
+            return lowered[candidate_lower]
+    return None
+
+
+def _extract_text_fields(entry: Dict[str, Any], dest_language: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    ignore_keys = {
+        "start",
+        "end",
+        "start_time",
+        "end_time",
+        "start_ms",
+        "end_ms",
+        "duration",
+        "duration_ms",
+        "timestamp",
+        "time",
+        "index",
+        "type",
+        "speaker",
+        "language",
+        "source_language",
+        "target_language",
+    }
+    lower_dest = dest_language.lower() if dest_language else ""
+    translation_candidates = [
+        "translated_text",
+        "translation",
+        "translation_text",
+        "target_text",
+        "target",
+        "output",
+        "output_text",
+        "translation_result",
+        "english",
+        "en",
+    ]
+    if lower_dest:
+        translation_candidates.extend([
+            lower_dest,
+            lower_dest.replace("-", "_"),
+            lower_dest.replace(" ", "_"),
+        ])
+    source_candidates = [
+        "source_text",
+        "source",
+        "original_text",
+        "original",
+        "transcript",
+        "transcription",
+        "input_text",
+        "utterance",
+        "text",
+        "chinese",
+        "zh",
+        "cn",
+    ]
+    translation_key = _find_case_insensitive_key(entry, translation_candidates, ignore_keys)
+    source_key = _find_case_insensitive_key(entry, source_candidates, ignore_keys)
+
+    def _fallback_key(preferred_key: Optional[str]) -> Optional[str]:
+        if preferred_key is not None:
+            return preferred_key
+        for key, value in entry.items():
+            key_lower = str(key).lower()
+            if key_lower in ignore_keys:
+                continue
+            if isinstance(value, str) and value.strip():
+                return key
+        return None
+
+    source_key = _fallback_key(source_key)
+    translation_key = _fallback_key(translation_key)
+
+    source_text = entry.get(source_key) if source_key else None
+    translated_text = entry.get(translation_key) if translation_key else None
+    return source_text, translated_text, source_key, translation_key
+
+
+def _coerce_to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _merge_short_speech_segments(segments: List[Dict[str, Any]], min_duration_ms: int) -> List[Dict[str, Any]]:
+    merged_segments: List[Dict[str, Any]] = []
+    i = 0
+    total = len(segments)
+
+    def _concat_text(a: Optional[str], b: Optional[str]) -> str:
+        parts = [part.strip() for part in [a or "", b or ""] if part and part.strip()]
+        return " ".join(parts)
+
+    while i < total:
+        segment = segments[i]
+        if segment.get("type") != "speech":
+            merged_segments.append(segment)
+            i += 1
+            continue
+
+        start_ms = int(segment.get("start_ms", 0))
+        end_ms = int(segment.get("end_ms", start_ms))
+        source_text = segment.get("source_text", "")
+        translated_text = segment.get("translated_text", "")
+        raw_chunks: List[Any] = [segment.get("raw_chunk")]
+        raw_indices: List[Any] = [segment.get("raw_chunk_index")]
+
+        j = i + 1
+
+        # Merge forward with following silence/speech until threshold reached
+        # Only merge if silence intervals are short (<= MAX_MERGE_INTERVAL_MS)
+        while end_ms - start_ms < min_duration_ms and j < total:
+            next_segment = segments[j]
+            seg_type = next_segment.get("type")
+            if seg_type == "silence":
+                silence_duration = int(next_segment.get("duration_ms", 0))
+                # Only merge if silence is short enough
+                if silence_duration <= MAX_MERGE_INTERVAL_MS:
+                    end_ms = int(next_segment.get("end_ms", end_ms))
+                    j += 1
+                    continue
+                else:
+                    # Silence gap too long, stop merging forward
+                    break
+            if seg_type == "speech":
+                end_ms = int(next_segment.get("end_ms", end_ms))
+                source_text = _concat_text(source_text, next_segment.get("source_text"))
+                translated_text = _concat_text(translated_text, next_segment.get("translated_text"))
+                raw_chunks.append(next_segment.get("raw_chunk"))
+                raw_indices.append(next_segment.get("raw_chunk_index"))
+                j += 1
+                continue
+            break
+
+        duration_ms = end_ms - start_ms
+
+        if duration_ms < min_duration_ms and merged_segments:
+            # Merge backward with previous speech if forward merge insufficient
+            # Find the last speech segment in merged_segments
+            prev_speech_idx = len(merged_segments) - 1
+            while prev_speech_idx >= 0 and merged_segments[prev_speech_idx].get("type") != "speech":
+                prev_speech_idx -= 1
+            
+            if prev_speech_idx >= 0:
+                prev_segment = merged_segments[prev_speech_idx]
+                prev_end_ms = int(prev_segment.get("end_ms", 0))
+                gap_ms = start_ms - prev_end_ms
+                # Only merge backward if gap is short enough
+                if gap_ms <= MAX_MERGE_INTERVAL_MS:
+                    prev_segment["end_ms"] = end_ms
+                    prev_segment["duration_ms"] = end_ms - int(prev_segment.get("start_ms", start_ms))
+                    prev_segment["end"] = _format_ms_to_timestamp(end_ms)
+                    prev_segment["source_text"] = _concat_text(prev_segment.get("source_text"), source_text)
+                    prev_segment["translated_text"] = _concat_text(prev_segment.get("translated_text"), translated_text)
+
+                    prev_raw = prev_segment.get("raw_chunk")
+                    if isinstance(prev_raw, list):
+                        prev_raw.extend(raw_chunks)
+                    elif prev_raw is None:
+                        prev_segment["raw_chunk"] = raw_chunks
+                    else:
+                        prev_segment["raw_chunk"] = [prev_raw] + raw_chunks
+
+                    prev_indices = prev_segment.get("raw_chunk_index")
+                    raw_indices_clean = [idx for idx in raw_indices if idx is not None]
+                    if raw_indices_clean:
+                        if isinstance(prev_indices, list):
+                            prev_indices.extend(raw_indices_clean)
+                        elif prev_indices is None:
+                            prev_segment["raw_chunk_index"] = raw_indices_clean
+                        else:
+                            prev_segment["raw_chunk_index"] = [prev_indices] + raw_indices_clean
+
+                    i = j
+                    continue
+
+        new_segment = dict(segment)
+        new_segment["start_ms"] = start_ms
+        new_segment["end_ms"] = end_ms
+        new_segment["duration_ms"] = duration_ms
+        new_segment["start"] = _format_ms_to_timestamp(start_ms)
+        new_segment["end"] = _format_ms_to_timestamp(end_ms)
+        new_segment["source_text"] = source_text
+        new_segment["translated_text"] = translated_text
+
+        raw_chunks_clean = [chunk for chunk in raw_chunks if chunk is not None]
+        if raw_chunks_clean:
+            new_segment["raw_chunk"] = raw_chunks_clean if len(raw_chunks_clean) > 1 else raw_chunks_clean[0]
+        raw_indices_clean = [idx for idx in raw_indices if idx is not None]
+        if raw_indices_clean:
+            new_segment["raw_chunk_index"] = raw_indices_clean if len(raw_indices_clean) > 1 else raw_indices_clean[0]
+
+        merged_segments.append(new_segment)
+        i = j
+
+    # Reassign indices
+    for idx, seg in enumerate(merged_segments):
+        seg["index"] = idx
+
+    return merged_segments
+
+
+def _guess_audio_format_from_mime(mime_type: Optional[str]) -> Optional[str]:
+    if not mime_type:
+        return None
+    mime = mime_type.lower()
+    mapping = {
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+        "audio/wave": "wav",
+        "audio/mpeg": "mp3",
+        "audio/mp3": "mp3",
+        "audio/ogg": "ogg",
+        "audio/ogg; codecs=opus": "ogg",
+        "audio/webm": "webm",
+        "audio/opus": "opus",
+        "audio/flac": "flac",
+        "audio/aac": "aac",
+        "audio/mp4": "mp4",
+        "audio/m4a": "mp4",
+        "audio/x-m4a": "mp4",
+        "audio/vnd.wave": "wav",
+    }
+    return mapping.get(mime)
+
+
+def _prepare_translation_segments(
+    original_audio: AudioSegment,
+    chunk_data: List[Dict[str, Any]],
+    dest_language: str,
+) -> List[Dict[str, Any]]:
+    total_duration_ms = len(original_audio)
+    segments: List[Dict[str, Any]] = []
+    current_ms = 0
+
+    def _get_timestamp(entry: Dict[str, Any], keys: List[str]) -> Optional[int]:
+        for key in keys:
+            if key in entry:
+                parsed = _parse_timestamp_to_ms(entry[key])
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _ensure_silence(duration_ms: int, position: str) -> Optional[Dict[str, Any]]:
+        if duration_ms <= 0:
+            return None
+        start_ms = current_ms
+        end_ms = current_ms + duration_ms
+        segment_payload = {
+            "type": "silence",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": duration_ms,
+            "start": _format_ms_to_timestamp(start_ms),
+            "end": _format_ms_to_timestamp(end_ms),
+            "position": position,
+        }
+        return segment_payload
+
+    if not chunk_data:
+        raise ValueError("Gemini returned no transcription segments.")
+
+    for idx, entry in enumerate(chunk_data):
+        if not isinstance(entry, dict):
+            continue
+
+        start_ms = _get_timestamp(
+            entry,
+            [
+                "start_ms",
+                "startMilliseconds",
+                "start_milliseconds",
+                "start",
+                "start_time",
+                "begin",
+                "from",
+            ],
+        )
+        end_ms = _get_timestamp(
+            entry,
+            [
+                "end_ms",
+                "endMilliseconds",
+                "end_milliseconds",
+                "end",
+                "end_time",
+                "stop",
+                "to",
+            ],
+        )
+
+        if start_ms is None:
+            start_ms = current_ms
+        if end_ms is None:
+            duration_ms = _get_timestamp(
+                entry,
+                ["duration_ms", "durationMilliseconds", "duration", "length", "segment_duration"],
+            )
+            if duration_ms is not None:
+                end_ms = start_ms + duration_ms
+
+        if end_ms is None:
+            # Fallback: assume contiguous audio up to detected order
+            # Use remainder of audio divided equally over remaining segments
+            remaining_segments = max(len(chunk_data) - idx, 1)
+            remaining_ms = max(total_duration_ms - start_ms, 0)
+            avg_duration = remaining_ms // remaining_segments if remaining_segments else remaining_ms
+            end_ms = start_ms + avg_duration
+
+        start_ms = max(0, min(start_ms, total_duration_ms))
+        end_ms = max(0, min(end_ms, total_duration_ms))
+        if start_ms < current_ms:
+            start_ms = current_ms
+        if end_ms <= start_ms:
+            continue
+
+        # Add silence if there is a gap before this segment
+        if start_ms > current_ms:
+            silence_payload = _ensure_silence(start_ms - current_ms, "leading" if current_ms == 0 else "between")
+            if silence_payload:
+                silence_payload["index"] = len(segments)
+                segments.append(silence_payload)
+            current_ms = start_ms
+
+        source_text, translated_text, source_key, translation_key = _extract_text_fields(entry, dest_language)
+        if isinstance(source_text, str):
+            source_text_value = source_text.strip()
+        elif source_text is None:
+            source_text_value = ""
+        else:
+            source_text_value = str(source_text)
+
+        if isinstance(translated_text, str):
+            translated_text_value = translated_text.strip()
+        elif translated_text is None:
+            translated_text_value = ""
+        else:
+            translated_text_value = str(translated_text)
+
+        segment_payload: Dict[str, Any] = {
+            "type": "speech",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": end_ms - start_ms,
+            "start": _format_ms_to_timestamp(start_ms),
+            "end": _format_ms_to_timestamp(end_ms),
+            "source_text": source_text_value,
+            "translated_text": translated_text_value,
+            "text_keys": {
+                "source": source_key,
+                "translated": translation_key,
+            },
+            "raw_chunk_index": idx,
+            "raw_chunk": entry,
+        }
+        segment_payload["index"] = len(segments)
+        segments.append(segment_payload)
+        current_ms = end_ms
+
+    # Add trailing silence if needed
+    if current_ms < total_duration_ms:
+        remaining = total_duration_ms - current_ms
+        silence_payload = _ensure_silence(remaining, "trailing")
+        if silence_payload:
+            silence_payload["index"] = len(segments)
+            segments.append(silence_payload)
+
+    segments = _merge_short_speech_segments(segments, MIN_SPEECH_DURATION_MS)
+
+    return segments
+
+
+def _create_silence_segment(duration_ms: int, frame_rate: int, sample_width: int, channels: int) -> AudioSegment:
+    duration_ms = max(0, int(duration_ms))
+    silence = AudioSegment.silent(duration=duration_ms, frame_rate=frame_rate)
+    silence = silence.set_sample_width(sample_width)
+    silence = silence.set_channels(channels)
+    return silence
+
+
+def _match_segment_duration(
+    segment: AudioSegment,
+    target_ms: int,
+    frame_rate: int,
+    sample_width: int,
+    channels: int,
+) -> AudioSegment:
+    target_ms = max(0, int(target_ms))
+    segment = segment.set_frame_rate(frame_rate)
+    segment = segment.set_sample_width(sample_width)
+    segment = segment.set_channels(channels)
+
+    if target_ms == 0:
+        return _create_silence_segment(0, frame_rate, sample_width, channels)
+
+    current_ms = len(segment)
+    tolerance_ms = 100
+    diff = target_ms - current_ms
+    if diff > 0:
+        if diff <= tolerance_ms:
+            return segment + _create_silence_segment(diff, frame_rate, sample_width, channels)
+        return segment + _create_silence_segment(diff, frame_rate, sample_width, channels)
+    # Never trim segments; return original even if longer than target.
+    return segment
+
+
+async def _synthesize_translated_audio(
+    original_audio: AudioSegment,
+    segments: List[Dict[str, Any]],
+    dest_language: str,
+    response_format: str = TRANSLATE_DEFAULT_OUTPUT_FORMAT,
+    bitrate: str = TRANSLATE_DEFAULT_BITRATE,
+    input_mime_type: Optional[str] = None,
+    clearvoice_settings: Optional[Dict[str, bool]] = None,
+) -> Tuple[bytes, str, Dict[str, Any]]:
+    tts = tts_manager.get_tts()
+    frame_rate = int(original_audio.frame_rate or 22050)
+    sample_width = int(original_audio.sample_width or 2)
+    channels = int(original_audio.channels or 1)
+
+    combined_audio = _create_silence_segment(0, frame_rate, sample_width, channels)
+    generation_log: List[Dict[str, Any]] = []
+    semaphore = asyncio.Semaphore(TRANSLATION_TTS_CONCURRENCY)
+
+    async def process_segment(index: int, segment: Dict[str, Any]):
+        seg_type = segment.get("type")
+        start_ms = int(segment.get("start_ms", 0))
+        end_ms = int(segment.get("end_ms", start_ms))
+        duration_ms = max(0, int(segment.get("duration_ms", max(0, end_ms - start_ms))))
+
+        if seg_type == "silence":
+            audio_seg = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
+            log_entry = {
+                "index": index,
+                "type": "silence",
+                "duration_ms": duration_ms,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+            }
+            return index, audio_seg, log_entry
+
+        translated_text = (segment.get("translated_text") or "").strip()
+        source_text = (segment.get("source_text") or "").strip()
+        if not translated_text:
+            audio_seg = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
+            log_entry = {
+                "index": index,
+                "type": "speech",
+                "status": "skipped",
+                "reason": "empty_translation",
+                "source_text": source_text,
+                "duration_ms": duration_ms,
+            }
+            return index, audio_seg, log_entry
+
+        chunk_audio = original_audio[start_ms:end_ms]
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_chunk:
+            chunk_audio.export(tmp_chunk.name, format="wav")
+            chunk_path = tmp_chunk.name
+
+        generation_target_ms = max(0, duration_ms - AUDIO_GENERATION_MARGIN_MS)
+        generated_path = os.path.join("outputs", f"translate_{uuid.uuid4().hex}.wav")
+
+        status = "success"
+        error_message = None
+        generated_audio: Optional[AudioSegment] = None
+
+        try:
+            async with semaphore:
+                inference_path = await tts.infer(
+                    spk_audio_prompt=chunk_path,
+                    text=translated_text,
+                    output_path=generated_path,
+                    interval_silence=0,
+                    speech_length=generation_target_ms,
+                    diffusion_steps=10,
+                    verbose=cmd_args.verbose,
+                )
+            generated_audio = AudioSegment.from_file(inference_path)
+            generated_audio = _match_segment_duration(generated_audio, duration_ms, frame_rate, sample_width, channels)
+        except Exception as exc:
+            status = "error"
+            error_message = str(exc)
+            print(f"⚠️ Translation synthesis failed for segment {index}: {error_message}")
+            generated_audio = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
+        finally:
+            if os.path.exists(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except Exception:
+                    pass
+            if os.path.exists(generated_path):
+                try:
+                    await async_remove_file(generated_path)
+                except Exception:
+                    pass
+
+        log_entry: Dict[str, Any] = {
+            "index": index,
+            "type": "speech",
+            "status": status,
+            "duration_ms": duration_ms,
+            "source_text": source_text,
+            "translated_text": translated_text,
+        }
+        if status == "error" and error_message:
+            log_entry["error"] = error_message
+
+        return index, generated_audio, log_entry
+
+    segment_tasks = [process_segment(idx, segment) for idx, segment in enumerate(segments)]
+    results = await asyncio.gather(*segment_tasks)
+    results.sort(key=lambda item: item[0])
+
+    for _, audio_segment, log_entry in results:
+        combined_audio += audio_segment
+        generation_log.append(log_entry)
+
+    original_duration_ms = len(original_audio)
+    final_duration_ms = len(combined_audio)
+    if final_duration_ms < original_duration_ms:
+        combined_audio += _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
+
+    buffer = BytesIO()
+    export_kwargs: Dict[str, Any] = {}
+    audio_format = (response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
+    if audio_format == "mp3" and bitrate:
+        export_kwargs["bitrate"] = bitrate
+    combined_audio.export(buffer, format=audio_format, **export_kwargs)
+    audio_bytes = buffer.getvalue()
+
+    media_type_map = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "opus": "audio/opus",
+        "ogg": "audio/ogg",
+        "webm": "audio/webm",
+    }
+    media_type = media_type_map.get(audio_format, f"audio/{audio_format}")
+
+    metadata = {
+        "dest_language": dest_language,
+        "segment_count": len(segments),
+        "speech_segment_count": sum(1 for s in segments if s["type"] == "speech"),
+        "silence_segment_count": sum(1 for s in segments if s["type"] == "silence"),
+        "original_duration_ms": original_duration_ms,
+        "generated_duration_ms": len(combined_audio),
+        "generation_log": generation_log,
+    }
+    if input_mime_type:
+        metadata["input_mime_type"] = input_mime_type
+    if clearvoice_settings:
+        metadata["clearvoice"] = clearvoice_settings
+
+    return audio_bytes, media_type, metadata
+
+
+async def _gemini_transcribe_translate(
+    audio_bytes: bytes,
+    mime_type: str,
+    dest_language: str,
+    prompt_text: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if genai is None:
+        raise RuntimeError(
+            "The google-genai package is required for translation. Install it with `pip install google-genai`."
+        )
+
+    api_key = os.getenv(GEMINI_API_KEY_ENV_VAR) or os.getenv(GOOGLE_API_KEY_ENV_VAR)
+    if not api_key:
+        raise RuntimeError(
+            f"Neither {GEMINI_API_KEY_ENV_VAR} nor {GOOGLE_API_KEY_ENV_VAR} environment variables are set."
+        )
+
+    prompt = (prompt_text or "").strip() or TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language)
+    model_name = _get_gemini_model_name()
+
+    if types is None:
+        raise RuntimeError(
+            "google-genai types module is unavailable. Ensure the `google-genai` package is installed and up to date."
+        )
+
+    client = _get_gemini_client(api_key)
+
+    user_content = types.Content(
+        role="user",
+        parts=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+    )
+
+    def _call_gemini() -> str:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[user_content],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=DEFAULT_GEMINI_TEMPERATURE,
+                top_p=DEFAULT_GEMINI_TOP_P,
+            ),
+        )
+
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        if prompt_feedback is not None:
+            block_reason = getattr(prompt_feedback, "block_reason", None)
+            if block_reason:
+                raise RuntimeError(f"Gemini blocked the prompt: {block_reason}")
+
+        text = _extract_text_from_gemini_response(response)
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+
+    loop = asyncio.get_event_loop()
+    raw_text = await loop.run_in_executor(executor, _call_gemini)
+    return _parse_gemini_json(raw_text)
+
 # Global TTS manager
 class TTSManager:
     _instance = None
@@ -753,6 +1572,28 @@ class SpeakerAPIWrapper:
 speaker_api = None
 
 # API Models
+class TranslateRequest(BaseModel):
+    audio: Optional[str] = Field(default=None, description="Base64-encoded audio or download URL.")
+    dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
+    audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
+    prompt: Optional[str] = Field(default=None, description="Optional custom prompt for Gemini.")
+    response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
+        default=None, description="Desired audio format for the translated output."
+    )
+    bitrate: Optional[str] = Field(
+        default=None,
+        description="Optional bitrate (e.g., '192k') when using lossy codecs such as MP3.",
+    )
+    enhance_voice: Optional[bool] = Field(
+        default=False,
+        description="Apply ClearVoice MossFormer2_SE_48K enhancement before translation.",
+    )
+    super_resolution_voice: Optional[bool] = Field(
+        default=False,
+        description="Apply ClearVoice MossFormer2_SR_48K super-resolution before translation.",
+    )
+
+
 class CloneRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
     reference_audio: Optional[str] = Field(default=None, description="Reference audio URL or base64")
@@ -1085,6 +1926,7 @@ async def home():
             <div class="content">
                 <div class="tabs">
                     <div class="tab active" onclick="switchTab('synthesis')">🎵 Speech Synthesis</div>
+                    <div class="tab" onclick="switchTab('translate')">🌐 Speech Translate</div>
                     <div class="tab" onclick="switchTab('speakers')">🎭 Speaker Management</div>
                     <div class="tab" onclick="switchTab('api')">📚 API Documentation</div>
                 </div>
@@ -1260,6 +2102,63 @@ async def home():
                     </div>
                 </div>
 
+                <!-- Speech Translation Tab -->
+                <div id="translate" class="tab-content">
+                    <div class="form-section">
+                        <h3>🌐 Speech Translation</h3>
+                        <p style="color: #666; margin-bottom: 20px;">
+                            Upload source speech audio and specify the destination language. The system will transcribe,
+                            translate, and regenerate speech with the original timing and vocal characteristics.
+                        </p>
+                        <form id="translateForm" enctype="multipart/form-data">
+                            <div class="form-group">
+                                <label for="translateAudioFile">Source Audio:</label>
+                                <input type="file" id="translateAudioFile" name="audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" required>
+                                <small style="color: #666; display: block; margin-top: 6px;">
+                                    Supported formats: WAV, MP3, M4A, FLAC, AAC, OGG, OPUS. Audio is processed locally then sent to Gemini for transcription.
+                                </small>
+                            </div>
+                            <div class="form-group">
+                                <label for="translateDestLanguage">Destination Language:</label>
+                                <select id="translateDestLanguage" name="dest_language" required>
+                                    <option value="">Select a language...</option>
+                                    <option value="English">English</option>
+                                    <option value="Chinese">Chinese</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="translateOutputFormat">Output Format:</label>
+                                <select id="translateOutputFormat" name="response_format">
+                                    <option value="mp3" selected>MP3 (default)</option>
+                                    <option value="wav">WAV</option>
+                                    <option value="flac">FLAC</option>
+                                    <option value="aac">AAC</option>
+                                    <option value="opus">OPUS</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>ClearVoice Preprocessing (Optional):</label>
+                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateEnhancement">
+                                        <span>Enhance with MossFormer2_SE_48K</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateSuperResolution">
+                                        <span>Super Resolution with MossFormer2_SR_48K</span>
+                                    </label>
+                                </div>
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    Defaults to off. Requires the ClearVoice package to be installed.
+                                </small>
+                            </div>
+                            <button type="submit" class="btn" id="translateBtn">🌐 Translate Speech</button>
+                        </form>
+                        <div id="translateStatus" class="status"></div>
+                        <div id="translateResult"></div>
+                    </div>
+                </div>
+
                 <!-- Speaker Management Tab -->
                 <div id="speakers" class="tab-content">
                     <div class="form-section">
@@ -1342,6 +2241,17 @@ async def home():
                             <li><strong>POST /delete_speaker</strong> - Remove an existing speaker preset
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string)</li>
+                                </ul>
+                            </li>
+                        </ul>
+
+                        <h5>🌐 Speech Translation</h5>
+                        <ul style="margin-left: 20px; line-height: 1.6;">
+                            <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
+                                <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool) and <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing.</li>
+                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false}</code></li>
+                                    <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
                             </li>
                         </ul>
@@ -1835,6 +2745,108 @@ async def home():
                 }
             });
 
+            const translateForm = document.getElementById('translateForm');
+            if (translateForm) {
+                translateForm.addEventListener('submit', async function(e) {
+                    e.preventDefault();
+
+                    const statusId = 'translateStatus';
+                    const resultDiv = document.getElementById('translateResult');
+                    const audioInput = document.getElementById('translateAudioFile');
+                    const destInput = document.getElementById('translateDestLanguage');
+                    const formatSelect = document.getElementById('translateOutputFormat');
+                    const translateBtn = document.getElementById('translateBtn');
+
+                    hideStatus(statusId);
+                    resultDiv.innerHTML = '';
+
+                    if (!audioInput.files || audioInput.files.length === 0) {
+                        showStatus('Please select a source audio file.', 'error', statusId);
+                        return;
+                    }
+
+                    const destLanguage = destInput.value.trim();
+                    if (!destLanguage) {
+                        showStatus('Please select a destination language.', 'error', statusId);
+                        return;
+                    }
+
+                    const selectedFormat = (formatSelect.value || 'mp3').toLowerCase();
+
+                    const formData = new FormData();
+                    formData.append('audio_file', audioInput.files[0]);
+                    formData.append('dest_language', destLanguage);
+                    formData.append('response_format', selectedFormat);
+                    const translateEnhanceEl = document.getElementById('translateEnhancement');
+                    const translateSuperEl = document.getElementById('translateSuperResolution');
+                    formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
+                    formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+
+                    try {
+                        translateBtn.disabled = true;
+                        showStatus('Translating speech... this may take a moment ⏳', 'success', statusId);
+
+                        const response = await fetch('/api/translate_audio', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        const contentType = response.headers.get('Content-Type') || '';
+
+                        if (!response.ok) {
+                            let errorMessage = `Translation failed (${response.status})`;
+                            if (contentType.includes('application/json')) {
+                                try {
+                                    const errorData = await response.json();
+                                    errorMessage = errorData.message || errorData.error || errorMessage;
+                                } catch (jsonError) {
+                                    console.warn('Failed to parse error response:', jsonError);
+                                }
+                            }
+                            showStatus(errorMessage, 'error', statusId);
+                            return;
+                        }
+
+                        if (contentType.startsWith('audio/')) {
+                            const blob = await response.blob();
+                            const audioUrl = URL.createObjectURL(blob);
+                            const downloadName = `translated_speech.${selectedFormat}`;
+
+                            resultDiv.innerHTML = `
+                                <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
+                                <div style="margin-top: 12px;">
+                                    <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
+                                </div>
+                            `;
+
+                            const segmentCount = response.headers.get('X-Translation-Segments');
+                            const modelHeader = response.headers.get('X-Translation-Model');
+                            let statusMessage = '✅ Translation complete!';
+                            if (segmentCount) {
+                                statusMessage += ` (${segmentCount} segments)`;
+                            }
+                            if (modelHeader) {
+                                statusMessage += ` • Gemini model: ${modelHeader}`;
+                            }
+                            showStatus(statusMessage, 'success', statusId);
+                        } else {
+                            try {
+                                const data = await response.json();
+                                const message = data.message || data.error || 'Translation failed.';
+                                showStatus(message, 'error', statusId);
+                            } catch (parseError) {
+                                showStatus('Translation failed: unexpected response format.', 'error', statusId);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Translation error:', error);
+                        showStatus(`Translation error: ${error.message}`, 'error', statusId);
+                    } finally {
+                        translateBtn.disabled = false;
+                    }
+                });
+            }
+
             async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
                     let response;
                     const voiceFiles = document.getElementById('voice_files').files;
@@ -2282,6 +3294,218 @@ async def api_clear_outputs():
             "message": f"Failed to clear outputs: {str(e)}"
         }
 
+
+@app.post("/api/translate_audio")
+async def api_translate_audio(
+    request: Request,
+    dest_language: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    bitrate: Optional[str] = Form(None),
+    audio: Optional[str] = Form(None),
+    audio_mime_type: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    enhance_voice: Optional[bool] = Form(False),
+    super_resolution_voice: Optional[bool] = Form(False),
+    audio_file: Optional[UploadFile] = File(None),
+):
+    """API: Translate speech audio to a target language and return synthesized audio."""
+    try:
+        payload: Optional[Dict[str, Any]] = None
+        dest_language_value = dest_language
+        audio_reference = audio
+        audio_mime_type_value = audio_mime_type
+        prompt_override = prompt
+        response_format_value = response_format
+        bitrate_value = bitrate
+        enhance_voice_value = enhance_voice
+        super_resolution_voice_value = super_resolution_voice
+
+        content_type = request.headers.get("content-type", "")
+        if (
+            dest_language is None
+            and not audio_reference
+            and audio_file is None
+            and "application/json" in content_type.lower()
+        ):
+            try:
+                payload = await request.json()
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
+                )
+
+        if payload is not None:
+            try:
+                translate_req = TranslateRequest(**payload)
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Invalid translate request: {str(exc)}"},
+                )
+            dest_language_value = translate_req.dest_language
+            audio_reference = translate_req.audio or audio_reference
+            audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
+            prompt_override = translate_req.prompt or prompt_override
+            response_format_value = translate_req.response_format or response_format_value
+            bitrate_value = translate_req.bitrate or bitrate_value
+            enhance_voice_value = translate_req.enhance_voice if translate_req.enhance_voice is not None else enhance_voice_value
+            super_resolution_voice_value = (
+                translate_req.super_resolution_voice if translate_req.super_resolution_voice is not None else super_resolution_voice_value
+            )
+
+        dest_language_value = (dest_language_value or "").strip()
+        if not dest_language_value:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Destination language (dest_language) is required."},
+            )
+
+        response_format_value = (response_format_value or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
+        allowed_formats = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
+        if response_format_value not in allowed_formats:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": f"Unsupported response_format '{response_format_value}'. Allowed: {', '.join(sorted(allowed_formats))}",
+                },
+            )
+
+        bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
+        apply_enhancement = _coerce_to_bool(enhance_voice_value)
+        apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+
+        audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+        if audio_io is None:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "No audio provided for translation."},
+            )
+
+        audio_bytes = audio_io.read()
+        if not audio_bytes:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Provided audio data is empty."},
+            )
+
+        input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
+        audio_format = _guess_audio_format_from_mime(input_mime_type)
+
+        try:
+            audio_buffer = BytesIO(audio_bytes)
+            if audio_format:
+                original_audio = AudioSegment.from_file(audio_buffer, format=audio_format)
+            else:
+                original_audio = AudioSegment.from_file(audio_buffer)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
+            )
+
+        processed_paths: Set[str] = set()
+        if apply_enhancement or apply_super_resolution:
+            if ClearVoice is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "message": "ClearVoice package is required for enhancement or super-resolution.",
+                    },
+                )
+
+            temp_input_path = None
+            final_processed_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
+                    original_audio.export(tmp_input.name, format="wav")
+                    temp_input_path = tmp_input.name
+                processed_paths.add(temp_input_path)
+
+                final_processed_path, clearvoice_paths = await apply_clearvoice_processing(
+                    temp_input_path,
+                    apply_enhancement,
+                    apply_super_resolution,
+                )
+                processed_paths.update(clearvoice_paths)
+                processed_paths.add(final_processed_path)
+
+                original_audio = AudioSegment.from_file(final_processed_path, format="wav")
+            except Exception as cv_error:
+                for path in processed_paths:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": f"ClearVoice processing failed: {str(cv_error)}"},
+                )
+            finally:
+                for path in processed_paths:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+        with BytesIO() as processed_buffer:
+            original_audio.export(processed_buffer, format="wav")
+            processed_audio_bytes = processed_buffer.getvalue()
+        gemini_mime_type = "audio/wav"
+
+        final_prompt = (prompt_override or "").strip()
+        if not final_prompt:
+            final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
+
+        gemini_chunks = await _gemini_transcribe_translate(processed_audio_bytes, gemini_mime_type, dest_language_value, final_prompt)
+        segments = _prepare_translation_segments(original_audio, gemini_chunks, dest_language_value)
+
+        audio_payload, media_type, metadata = await _synthesize_translated_audio(
+            original_audio,
+            segments,
+            dest_language_value,
+            response_format=response_format_value,
+            bitrate=bitrate_value,
+            input_mime_type=input_mime_type,
+            clearvoice_settings={
+                "enhancement": apply_enhancement,
+                "super_resolution": apply_super_resolution,
+            },
+        )
+
+        headers = {
+            "Content-Disposition": f"attachment; filename=translated_speech.{response_format_value}",
+            "X-Translation-Model": _get_gemini_model_name(),
+            "X-Translation-Segments": str(metadata.get("segment_count", len(segments))),
+            "X-Translation-Speech-Segments": str(metadata.get("speech_segment_count", 0)),
+            "X-Translation-Silence-Segments": str(metadata.get("silence_segment_count", 0)),
+            "X-Translation-Input-Mime": input_mime_type or "",
+            "X-Translation-ClearVoice": f"enhancement={str(apply_enhancement).lower()};super_resolution={str(apply_super_resolution).lower()}",
+        }
+
+        print(
+            f"✅ Translation complete: {metadata.get('segment_count', len(segments))} segments "
+            f"({metadata.get('speech_segment_count', 0)} speech / {metadata.get('silence_segment_count', 0)} silence), "
+            f"dest_language={dest_language_value}, format={response_format_value}, input_mime={input_mime_type}"
+        )
+
+        return Response(content=audio_payload, media_type=media_type, headers=headers)
+
+    except RuntimeError as runtime_error:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(runtime_error)},
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Translation failed: {str(exc)}"},
+        )
+
+
 # API Helper Functions (matching deploy_vllm_indextts.py exactly)
 async def get_audio_bytes_from_url(url: str) -> bytes:
     """Download audio from URL"""
@@ -2315,8 +3539,14 @@ async def load_base64_or_url(audio: str) -> BytesIO:
     if audio.startswith("http://") or audio.startswith("https://"):
         audio_bytes = await get_audio_bytes_from_url(audio)
     else:
+        payload = audio.strip()
+        if payload.startswith("data:"):
+            try:
+                _, payload = payload.split(",", 1)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid data URI audio: {str(e)}") from e
         try:
-            audio_bytes = base64.b64decode(audio)
+            audio_bytes = base64.b64decode(payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid base64 audio data: {str(e)}")
     
