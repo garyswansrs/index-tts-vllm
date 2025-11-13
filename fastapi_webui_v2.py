@@ -20,7 +20,7 @@ import tempfile
 import traceback
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Literal
+from typing import Any, List, Dict, Optional, Literal, Tuple, Set
 from contextlib import asynccontextmanager
 from io import BytesIO
 import base64
@@ -32,6 +32,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
+
+try:
+    from clearvoice import ClearVoice  # type: ignore[import]
+except ImportError:
+    ClearVoice = None
 
 
 # FastAPI and web interface
@@ -257,7 +262,7 @@ def _detect_silence_intervals(audio_data, sample_rate, min_silence_duration=0.3,
 def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
     """
     Smart audio cutting that uses silence intervals as natural cut points.
-    Tries to find a segment between 3s and max_duration that ends at a silence.
+    Tries to find a segment between 3s and 15s that ends at a silence.
     
     Args:
         input_path: Path to input audio file
@@ -277,9 +282,9 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
             print(f"📏 Audio duration ({total_duration:.1f}s) is too short, keeping original")
             return input_path
         
-        # If audio is between 3s and max_duration, return original
-        if total_duration <= max_duration:
-            print(f"📏 Audio duration ({total_duration:.1f}s) is within ideal range (3.0-{max_duration}s)")
+        # If audio is between 3s and 15s, return original
+        if total_duration <= 15.0:
+            print(f"📏 Audio duration ({total_duration:.1f}s) is within ideal range (3-15s)")
             return input_path
         
         print(f"🔍 Analyzing audio ({total_duration:.1f}s) for silence intervals...")
@@ -288,7 +293,7 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         silence_intervals = _detect_silence_intervals(audio_data, sample_rate)
         
         if not silence_intervals:
-            print(f"⚠️ No silence intervals found, cutting at {max_duration} seconds")
+            print(f"⚠️ No silence intervals found, cutting at 10 seconds")
             cut_sample = int(10.0 * sample_rate)
             cut_audio = audio_data[:cut_sample]
         else:
@@ -302,8 +307,8 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
                 cut_sample = (start_silence + end_silence) // 2
                 cut_duration = cut_sample / sample_rate
                 
-                # Check if this cut point gives us a good duration (3s to max_duration)
-                if 3.0 <= cut_duration <= max_duration:
+                # Check if this cut point gives us a good duration (3s to 15s)
+                if 3.0 <= cut_duration <= 15.0:
                     best_cut_sample = cut_sample
                     print(f"✓ Found ideal cut point at {cut_duration:.1f}s (at silence interval)")
                     break
@@ -343,6 +348,76 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         print(f"❌ Error cutting audio: {e}")
         # Return original path if cutting fails
         return input_path
+
+
+def _append_suffix_to_path(file_path: str, suffix: str) -> str:
+    """Create a new path with the given suffix before the extension."""
+    path_obj = Path(file_path)
+    return str(path_obj.with_name(f"{path_obj.stem}{suffix}{path_obj.suffix}"))
+
+
+def _apply_clearvoice_processing_sync(
+    input_path: str,
+    apply_enhancement: bool,
+    apply_super_resolution: bool,
+) -> Tuple[str, List[str]]:
+    """Run ClearVoice enhancement/super-resolution synchronously."""
+    if ClearVoice is None:
+        raise RuntimeError("ClearVoice package is not available in the environment.")
+    
+    generated_paths: List[str] = []
+    current_input = input_path
+    final_path = input_path
+    
+    try:
+        if apply_enhancement:
+            print("✨ ClearVoice: Applying MossFormer2_SE_48K enhancement...")
+            enhancement_model = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
+            enhancement_output = enhancement_model(input_path=current_input, online_write=False)
+            enhanced_path = _append_suffix_to_path(current_input, "_se")
+            enhancement_model.write(enhancement_output, output_path=enhanced_path)
+            generated_paths.append(enhanced_path)
+            final_path = enhanced_path
+            current_input = enhanced_path
+            print(f"✅ ClearVoice: Enhancement saved to {os.path.basename(enhanced_path)}")
+        
+        if apply_super_resolution:
+            print("🎛️ ClearVoice: Applying MossFormer2_SR_48K super-resolution...")
+            super_res_model = ClearVoice(task="speech_super_resolution", model_names=["MossFormer2_SR_48K"])
+            super_res_output = super_res_model(input_path=current_input, online_write=False)
+            super_res_path = _append_suffix_to_path(current_input, "_sr")
+            super_res_model.write(super_res_output, output_path=super_res_path)
+            generated_paths.append(super_res_path)
+            final_path = super_res_path
+            print(f"✅ ClearVoice: Super-resolution saved to {os.path.basename(super_res_path)}")
+        
+        return final_path, generated_paths
+    except Exception:
+        for created_path in generated_paths:
+            try:
+                os.remove(created_path)
+            except Exception:
+                pass
+        raise
+
+
+async def apply_clearvoice_processing(
+    input_path: str,
+    apply_enhancement: bool,
+    apply_super_resolution: bool,
+) -> Tuple[str, List[str]]:
+    """Async wrapper for ClearVoice processing."""
+    if not (apply_enhancement or apply_super_resolution):
+        return input_path, []
+    
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        _apply_clearvoice_processing_sync,
+        input_path,
+        apply_enhancement,
+        apply_super_resolution,
+    )
 
 async def convert_audio_to_format(wav_data, sample_rate, output_format="mp3", bitrate="128k"):
     """Convert audio data to specified format (MP3 or WAV)"""
@@ -470,11 +545,26 @@ class SpeakerAPIWrapper:
     def __init__(self, preset_manager: SpeakerPresetManager):
         self.preset_manager = preset_manager
     
-    async def add_speaker(self, speaker_name: str, audio_files: List[bytes], filenames: List[str]) -> Dict[str, str]:
-        """Add a new speaker with audio files"""
+    async def add_speaker(
+        self,
+        speaker_name: str,
+        audio_files: List[bytes],
+        filenames: List[str],
+        apply_enhancement: bool = False,
+        apply_super_resolution: bool = False,
+    ) -> Dict[str, str]:
+        """Add a new speaker with audio files and optional ClearVoice processing."""
         try:
             # Check if speaker already exists - run in thread pool
             loop = asyncio.get_event_loop()
+            clearvoice_requested = apply_enhancement or apply_super_resolution
+
+            if clearvoice_requested and ClearVoice is None:
+                return {
+                    "status": "error",
+                    "message": "ClearVoice package is required for enhancement or super-resolution. Install the `clearvoice` package to enable these options."
+                }
+
             existing_presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
             
             if speaker_name in existing_presets:
@@ -504,9 +594,40 @@ class SpeakerAPIWrapper:
             temp_path = temp_dir / f"{speaker_name}_{filename}"
             await async_write_file(str(temp_path), audio_data)
             
+            processed_paths: Set[str] = set()
+            processed_paths.add(str(temp_path))
+            final_audio_path = str(temp_path)
+
             try:
                 # Cut audio to 10 seconds if it exceeds the limit
                 cut_temp_path = await async_cut_audio_to_duration(str(temp_path), max_duration=10.0)
+                processed_paths.add(cut_temp_path)
+                final_audio_path = cut_temp_path
+                
+                if clearvoice_requested:
+                    try:
+                        final_audio_path, clearvoice_paths = await apply_clearvoice_processing(
+                            final_audio_path,
+                            apply_enhancement,
+                            apply_super_resolution,
+                        )
+                        processed_paths.update(clearvoice_paths)
+                    except Exception as cv_error:
+                        return {"status": "error", "message": f"ClearVoice processing failed: {str(cv_error)}"}
+                
+                processed_paths.add(final_audio_path)
+
+                description_parts = [
+                    f"Added via API with {len(audio_files)} audio files (auto-cut to 10s)"
+                ]
+                if clearvoice_requested:
+                    cv_features = []
+                    if apply_enhancement:
+                        cv_features.append("MossFormer2_SE_48K enhancement")
+                    if apply_super_resolution:
+                        cv_features.append("MossFormer2_SR_48K super-resolution")
+                    description_parts.append("ClearVoice: " + " + ".join(cv_features))
+                description = " | ".join(description_parts)
                 
                 # Use SpeakerPresetManager to add the speaker - run in thread pool to avoid blocking
                 # This operation processes audio through TTS pipeline and can take several seconds
@@ -514,32 +635,31 @@ class SpeakerAPIWrapper:
                     executor,
                     self.preset_manager.add_speaker_preset,
                     speaker_name,
-                    cut_temp_path,
-                    f"Added via API with {len(audio_files)} audio files (auto-cut to 10s)"
+                    final_audio_path,
+                    description
                 )
                 
                 if success:
-                    return {
+                    response: Dict[str, Any] = {
                         "status": "success", 
                         "message": f"Speaker '{speaker_name}' added successfully",
                         "info": "newly_added",
                         "audio_count": len(audio_files)
                     }
+                    if clearvoice_requested:
+                        response["clearvoice"] = {
+                            "enhancement": apply_enhancement,
+                            "super_resolution": apply_super_resolution
+                        }
+                    return response
                 else:
                     return {"status": "error", "message": f"Failed to add speaker '{speaker_name}'"}
             
             finally:
                 # Clean up temporary files asynchronously
                 try:
-                    # Clean up original temp file (if different from cut file)
-                    temp_exists = await loop.run_in_executor(executor, temp_path.exists)
-                    if temp_exists:
-                        await async_remove_file(str(temp_path))
-                    # Clean up cut file if it's different and exists
-                    if cut_temp_path != str(temp_path):
-                        cut_exists = await loop.run_in_executor(executor, os.path.exists, cut_temp_path)
-                        if cut_exists:
-                            await async_remove_file(cut_temp_path)
+                    for cleanup_path in processed_paths:
+                        await async_remove_file(cleanup_path)
                 except:
                     pass
             
@@ -564,7 +684,7 @@ class SpeakerAPIWrapper:
         except Exception as e:
             return {"status": "error", "message": f"Failed to delete speaker: {str(e)}"}
     
-    async def list_speakers(self) -> Dict[str, any]:
+    async def list_speakers(self) -> Dict[str, Any]:
         """List all speakers with metadata"""
         try:
             # Run the synchronous operation in thread pool to avoid blocking
@@ -1159,6 +1279,23 @@ async def home():
                                 </small>
                             </div>
                             
+                            <div class="form-group">
+                                <label>Pure Voice Extraction (ClearVoice, optional):</label>
+                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="applyEnhancement">
+                                        <span>Enhance with MossFormer2_SE_48K</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="applySuperResolution">
+                                        <span>Super Resolution with MossFormer2_SR_48K</span>
+                                    </label>
+                                </div>
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    Enable ClearVoice MossFormer2 models to clean and upscale the reference audio. When both are selected, enhancement runs before super-resolution.
+                                </small>
+                            </div>
+                            
                             <button type="submit" class="btn">➕ Add Speaker</button>
                         </form>
                         
@@ -1198,7 +1335,8 @@ async def home():
                             <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
-                                    <li>Audio will be automatically trimmed to 3-15 seconds at silence points</li>
+                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>)</li>
+                                    <li>Audio will be automatically trimmed to 3-15 seconds at silence points; when both toggles are enabled, enhancement runs before super-resolution</li>
                                 </ul>
                             </li>
                             <li><strong>POST /delete_speaker</strong> - Remove an existing speaker preset
@@ -1641,6 +1779,8 @@ async def home():
                     const formData = new FormData();
                     formData.append('name', speakerName);
                     formData.append('audio_file', audioFiles[0]); // /add_speaker uses single file
+                    formData.append('enhance_voice', document.getElementById('applyEnhancement').checked ? 'true' : 'false');
+                    formData.append('super_resolution_voice', document.getElementById('applySuperResolution').checked ? 'true' : 'false');
                     
                     const response = await fetch('/add_speaker', {
                         method: 'POST',
@@ -2202,6 +2342,8 @@ async def add_speaker(
     audio: Optional[str] = Form(None, description="Reference audio URL or base64"),
     reference_text: Optional[str] = Form(None, description="Optional transcript"),
     audio_file: Optional[UploadFile] = File(None, description="Upload reference audio file"),
+    enhance_voice: bool = Form(False, description="Apply ClearVoice MossFormer2_SE_48K enhancement"),
+    super_resolution_voice: bool = Form(False, description="Apply ClearVoice MossFormer2_SR_48K super-resolution"),
 ):
     """API: Add a new speaker"""
     try:
@@ -2234,34 +2376,32 @@ async def add_speaker(
         audio_data = audio_io.read()
         filename = audio_file.filename if audio_file else f"{name}_reference.wav"
         
-        # Save to temporary file and smart cut at silence intervals
-        temp_dir = Path("speaker_presets") / "temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = temp_dir / f"speaker_{name}_{filename}"
+        apply_enhancement = bool(enhance_voice)
+        apply_super_resolution_flag = bool(super_resolution_voice)
+        print(f"🎚️ API: ClearVoice options -> enhancement={apply_enhancement}, super_resolution={apply_super_resolution_flag}")
         
-        try:
-            await async_write_file(str(temp_path), audio_data)
-            # Smart cut: finds silence intervals and cuts at natural pauses (3-15s)
-            cut_temp_path = await async_cut_audio_to_duration(str(temp_path), max_duration=10.0)
-            
-            # Read the cut audio data
-            cut_audio_data = await async_read_file(cut_temp_path)
-            
-            # Add speaker using SpeakerPresetManager
-            result = await speaker_api.add_speaker(name, [cut_audio_data], [filename])
-            
-        finally:
-            # Clean up temporary files asynchronously
-            try:
-                if temp_path.exists():
-                    await async_remove_file(str(temp_path))
-                if cut_temp_path != str(temp_path) and os.path.exists(cut_temp_path):
-                    await async_remove_file(cut_temp_path)
-            except:
-                pass
+        if (apply_enhancement or apply_super_resolution_flag) and ClearVoice is None:
+            error_msg = "ClearVoice is required for enhancement or super-resolution. Install the `clearvoice` package to enable these options."
+            print(f"❌ API: {error_msg}")
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": error_msg}
+            )
+        
+        # Add speaker using SpeakerPresetManager (handles ClearVoice processing internally)
+        result = await speaker_api.add_speaker(
+            name,
+            [audio_data],
+            [filename],
+            apply_enhancement=apply_enhancement,
+            apply_super_resolution=apply_super_resolution_flag,
+        )
         
         if result["status"] == "success":
-            return JSONResponse(content={"success": True, "role": name})
+            payload = {"success": True, "role": name}
+            if result.get("clearvoice"):
+                payload["clearvoice"] = result["clearvoice"]
+            return JSONResponse(content=payload)
         else:
             return JSONResponse(
                 status_code=500,
