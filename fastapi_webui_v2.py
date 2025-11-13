@@ -11,11 +11,16 @@ Features:
 - Modern web interface with Chinese support
 - Parallel chunk processing for long texts
 - MP3 output support
+- Advanced translate/edit mode with segment editing and selective regeneration
+- Gemini model selection (Flash vs Pro) with optional API key override
+- Translation/transcription toggle with custom prompt support
+- Per-segment generation control for efficient audio processing
 """
 
 import os
 import sys
 import asyncio
+import time
 import tempfile
 import traceback
 import uuid
@@ -29,6 +34,8 @@ import json
 import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import copy
+from dataclasses import dataclass, field
 
 
 # Audio processing
@@ -72,7 +79,7 @@ executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fastapi_async")
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
-DEFAULT_GEMINI_MODEL_NAME = "gemini-flash-latest"
+DEFAULT_GEMINI_MODEL_NAME = "gemini-2.5-pro"
 JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 TRANSLATION_PROMPT_TEMPLATE = (
     "You are a professional interpreter. "
@@ -85,6 +92,17 @@ TRANSLATION_PROMPT_TEMPLATE = (
     "Ensure the timestamps align closely with the audio and split into coherent segments. "
     "Respond with JSON only—no explanations, markdown, or additional text."
 )
+TRANSCRIPTION_PROMPT_TEMPLATE = (
+    "You are a meticulous transcription expert. "
+    "Transcribe the provided speech audio in its original language without translating it. "
+    "Return a JSON array where each item contains the keys: "
+    "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
+    "\"end\" (same format), "
+    "\"source_text\" (the transcript in the original language), "
+    "\"translated_text\" (leave this empty string to indicate no translation). "
+    "Ensure timestamps align with the audio and segments remain coherent. "
+    "Respond with JSON only—no markdown or commentary."
+)
 DEFAULT_GEMINI_TEMPERATURE = 0.2
 DEFAULT_GEMINI_TOP_P = 0.9
 TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
@@ -93,6 +111,29 @@ AUDIO_GENERATION_MARGIN_MS = 20
 TRANSLATION_TTS_CONCURRENCY = 20
 MIN_SPEECH_DURATION_MS = 3000
 MAX_MERGE_INTERVAL_MS = 500
+
+
+@dataclass
+class TranslateSessionData:
+    session_id: str
+    original_audio: AudioSegment
+    dest_language: str
+    prompt: str
+    translate_enabled: bool
+    response_format: str
+    bitrate: str
+    input_mime_type: Optional[str]
+    clearvoice_settings: Dict[str, bool]
+    base_segments: List[Dict[str, Any]]
+    gemini_chunks: List[Dict[str, Any]]
+    gemini_model: str
+    gemini_api_key: Optional[str]
+    created_at: float = field(default_factory=lambda: time.time())
+
+
+ADVANCED_TRANSLATE_SESSIONS: Dict[str, TranslateSessionData] = {}
+ADVANCED_TRANSLATE_SESSION_LOCK = asyncio.Lock()
+ADVANCED_TRANSLATE_SESSION_TTL_SECONDS = 60 * 60  # 1 hour
 
 
 @functools.lru_cache(maxsize=4)
@@ -862,6 +903,147 @@ def _merge_short_speech_segments(segments: List[Dict[str, Any]], min_duration_ms
     return merged_segments
 
 
+def _segment_audio_data_uri(
+    audio: AudioSegment,
+    start_ms: int,
+    end_ms: int,
+    fmt: str = "wav",
+) -> Optional[str]:
+    start = max(0, int(start_ms))
+    end = max(start, int(end_ms))
+    audio_len = len(audio)
+    if start >= audio_len or start == end:
+        return None
+    if end > audio_len:
+        end = audio_len
+    snippet = audio[start:end]
+    if len(snippet) == 0:
+        return None
+    buffer = BytesIO()
+    snippet.export(buffer, format=fmt)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:audio/{fmt};base64,{encoded}"
+
+
+def _serialize_segments_for_ui(
+    segments: List[Dict[str, Any]],
+    audio: AudioSegment,
+) -> List[Dict[str, Any]]:
+    ui_segments: List[Dict[str, Any]] = []
+    for segment in segments:
+        seg_type = segment.get("type", "speech")
+        start_ms = int(segment.get("start_ms", 0))
+        end_ms = int(segment.get("end_ms", start_ms))
+        duration_ms = int(segment.get("duration_ms", max(0, end_ms - start_ms)))
+        base_payload = {
+            "index": segment.get("index"),
+            "type": seg_type,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": duration_ms,
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "source_text": segment.get("source_text", ""),
+            "translated_text": segment.get("translated_text", ""),
+            "text_keys": segment.get("text_keys", {}),
+        }
+        if seg_type == "speech":
+            base_payload["generate"] = True
+            preview = _segment_audio_data_uri(audio, start_ms, end_ms)
+            if preview:
+                base_payload["audio_preview"] = preview
+        else:
+            base_payload["generate"] = False
+        ui_segments.append(base_payload)
+    return ui_segments
+
+
+def _cleanup_expired_translate_sessions_locked(now: Optional[float] = None) -> None:
+    if now is None:
+        now = time.time()
+    expired: List[str] = [
+        session_id
+        for session_id, session in ADVANCED_TRANSLATE_SESSIONS.items()
+        if now - session.created_at > ADVANCED_TRANSLATE_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        ADVANCED_TRANSLATE_SESSIONS.pop(session_id, None)
+
+
+async def _create_translate_session(
+    original_audio: AudioSegment,
+    dest_language: str,
+    prompt: str,
+    translate_enabled: bool,
+    response_format: str,
+    bitrate: str,
+    input_mime_type: Optional[str],
+    clearvoice_settings: Dict[str, bool],
+    base_segments: List[Dict[str, Any]],
+    gemini_chunks: List[Dict[str, Any]],
+    gemini_model: str,
+    gemini_api_key: Optional[str],
+) -> TranslateSessionData:
+    session_id = uuid.uuid4().hex
+    session = TranslateSessionData(
+        session_id=session_id,
+        original_audio=original_audio,
+        dest_language=dest_language,
+        prompt=prompt,
+        translate_enabled=translate_enabled,
+        response_format=response_format,
+        bitrate=bitrate,
+        input_mime_type=input_mime_type,
+        clearvoice_settings=dict(clearvoice_settings or {}),
+        base_segments=copy.deepcopy(base_segments),
+        gemini_chunks=copy.deepcopy(gemini_chunks),
+        gemini_model=gemini_model,
+        gemini_api_key=gemini_api_key,
+    )
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        _cleanup_expired_translate_sessions_locked()
+        ADVANCED_TRANSLATE_SESSIONS[session_id] = session
+    return session
+
+
+async def _get_translate_session(session_id: str) -> Optional[TranslateSessionData]:
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        _cleanup_expired_translate_sessions_locked()
+        session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
+        if session:
+            session.created_at = time.time()
+        return session
+
+
+async def _update_translate_session_segments(
+    session_id: str, segments: List[Dict[str, Any]]
+) -> None:
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
+        if session:
+            session.base_segments = copy.deepcopy(segments)
+            session.created_at = time.time()
+
+
+async def _update_translate_session_metadata(
+    session_id: str,
+    *,
+    response_format: Optional[str] = None,
+    bitrate: Optional[str] = None,
+    gemini_model: Optional[str] = None,
+) -> None:
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
+        if session:
+            if response_format:
+                session.response_format = response_format
+            if bitrate:
+                session.bitrate = bitrate
+            if gemini_model:
+                session.gemini_model = gemini_model
+            session.created_at = time.time()
+
+
 def _guess_audio_format_from_mime(mime_type: Optional[str]) -> Optional[str]:
     if not mime_type:
         return None
@@ -1103,6 +1285,23 @@ async def _synthesize_translated_audio(
 
         translated_text = (segment.get("translated_text") or "").strip()
         source_text = (segment.get("source_text") or "").strip()
+        generate_segment = segment.get("generate", True)
+        keep_original = segment.get("keep_original", False) or (not generate_segment)
+
+        chunk_audio = original_audio[start_ms:end_ms]
+
+        if keep_original:
+            audio_seg = _match_segment_duration(chunk_audio, duration_ms, frame_rate, sample_width, channels)
+            log_entry = {
+                "index": index,
+                "type": "speech",
+                "status": "preserved",
+                "duration_ms": duration_ms,
+                "source_text": source_text,
+                "translated_text": translated_text,
+            }
+            return index, audio_seg, log_entry
+
         if not translated_text:
             audio_seg = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
             log_entry = {
@@ -1115,7 +1314,6 @@ async def _synthesize_translated_audio(
             }
             return index, audio_seg, log_entry
 
-        chunk_audio = original_audio[start_ms:end_ms]
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_chunk:
             chunk_audio.export(tmp_chunk.name, format="wav")
             chunk_path = tmp_chunk.name
@@ -1224,20 +1422,23 @@ async def _gemini_transcribe_translate(
     mime_type: str,
     dest_language: str,
     prompt_text: Optional[str] = None,
+    *,
+    model_name: Optional[str] = None,
+    api_key_override: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if genai is None:
         raise RuntimeError(
             "The google-genai package is required for translation. Install it with `pip install google-genai`."
         )
 
-    api_key = os.getenv(GEMINI_API_KEY_ENV_VAR) or os.getenv(GOOGLE_API_KEY_ENV_VAR)
+    api_key = (api_key_override or "").strip() or os.getenv(GEMINI_API_KEY_ENV_VAR) or os.getenv(GOOGLE_API_KEY_ENV_VAR)
     if not api_key:
         raise RuntimeError(
             f"Neither {GEMINI_API_KEY_ENV_VAR} nor {GOOGLE_API_KEY_ENV_VAR} environment variables are set."
         )
 
     prompt = (prompt_text or "").strip() or TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language)
-    model_name = _get_gemini_model_name()
+    model_name = (model_name or "").strip() or _get_gemini_model_name()
 
     if types is None:
         raise RuntimeError(
@@ -1592,6 +1793,33 @@ class TranslateRequest(BaseModel):
         default=False,
         description="Apply ClearVoice MossFormer2_SR_48K super-resolution before translation.",
     )
+    gemini_model: Optional[str] = Field(
+        default=None,
+        description="Override the Gemini model used for transcription/translation.",
+    )
+    gemini_api_key: Optional[str] = Field(
+        default=None,
+        description="Provide a Gemini API key for this request if environment key is not set.",
+    )
+
+
+class TranslateSegmentInput(BaseModel):
+    index: int
+    type: Literal["speech", "silence"] = "speech"
+    start_ms: int
+    end_ms: int
+    translated_text: Optional[str] = ""
+    source_text: Optional[str] = ""
+    generate: Optional[bool] = True
+
+
+class TranslateGenerateRequest(BaseModel):
+    session_id: str = Field(..., description="Session identifier returned from /api/translate_segments.")
+    segments: List[TranslateSegmentInput] = Field(..., description="Segments to render, including edits and selection.")
+    response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
+        default=None, description="Desired audio format for output. Defaults to the original request value."
+    )
+    bitrate: Optional[str] = Field(default=None, description="Optional bitrate for lossy codecs.")
 
 
 class CloneRequest(BaseModel):
@@ -1746,7 +1974,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="IndexTTS vLLM v2 FastAPI WebUI",
-    description="Ultra-fast TTS with vLLM backend and speaker presets",
+    description="Ultra-fast TTS with vLLM backend, speaker presets, and advanced translate/edit mode with Gemini integration",
     lifespan=lifespan
 )
 
@@ -1874,6 +2102,93 @@ async def home():
                 border: 1px solid #f5c6cb;
                 color: #721c24;
             }
+            .segment-panel {
+                margin-top: 25px;
+                border: 2px dashed #d7dcff;
+                padding: 20px;
+                border-radius: 15px;
+                background: #f7f8ff;
+            }
+            .segment-controls {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 15px;
+            }
+            .segment-list {
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+                max-height: 520px;
+                overflow-y: auto;
+                padding-right: 8px;
+            }
+            .segment-card {
+                border-radius: 12px;
+                border: 1px solid #dce1fa;
+                padding: 16px;
+                background: white;
+                box-shadow: 0 4px 16px rgba(102,126,234,0.08);
+            }
+            .segment-card.speech { border-left: 4px solid #667eea; }
+            .segment-card.silence { border-left: 4px solid #9aa0b6; }
+            .segment-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .segment-meta {
+                font-size: 0.9em;
+                color: #666;
+            }
+            .segment-body {
+                margin-top: 12px;
+                display: grid;
+                gap: 14px;
+            }
+            .segment-body textarea {
+                min-height: 80px;
+                font-size: 0.95em;
+            }
+            .segment-timing {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 12px;
+                align-items: end;
+            }
+            .segment-timing label {
+                font-weight: 500;
+                color: #444;
+            }
+            .segment-timing input {
+                width: 100%;
+            }
+            .segment-duration-label {
+                font-size: 0.85em;
+                color: #888;
+            }
+            .segment-checkbox {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-weight: 600;
+                color: #333;
+            }
+            .segment-audio {
+                width: 100%;
+                margin-top: 8px;
+            }
+            .segment-empty {
+                padding: 20px;
+                text-align: center;
+                background: rgba(102, 126, 234, 0.08);
+                border-radius: 12px;
+                color: #445;
+                font-weight: 500;
+            }
             .speaker-list {
                 background: #f8f9fa;
                 padding: 20px;
@@ -1912,7 +2227,7 @@ async def home():
         <div class="container">
             <div class="header">
                 <h1>🚀 IndexTTS vLLM v2</h1>
-                <p class="subtitle">Ultra-Fast TTS with vLLM Backend / 超快速中文语音合成</p>
+                <p class="subtitle">Ultra-Fast TTS with vLLM Backend / 超快速中英文语音合成</p>
                 <div>
                     <span class="performance-badge">⚡ vLLM v2 Backend</span>
                     <span class="performance-badge">🇨🇳 Chinese Support</span>
@@ -1921,12 +2236,14 @@ async def home():
                     <span class="performance-badge">🔌 API Integration</span>
                     <span class="performance-badge">😊 Emotion Text Control</span>
                     <span class="performance-badge">🌊 Streaming Mode</span>
+                    <span class="performance-badge">🌐 Translate/Edit Mode</span>
+                    <span class="performance-badge">✂️ Segment Editing</span>
                 </div>
             </div>
             <div class="content">
                 <div class="tabs">
                     <div class="tab active" onclick="switchTab('synthesis')">🎵 Speech Synthesis</div>
-                    <div class="tab" onclick="switchTab('translate')">🌐 Speech Translate</div>
+                    <div class="tab" onclick="switchTab('translate')">🌐 Speech Translate/Edit</div>
                     <div class="tab" onclick="switchTab('speakers')">🎭 Speaker Management</div>
                     <div class="tab" onclick="switchTab('api')">📚 API Documentation</div>
                 </div>
@@ -2105,10 +2422,9 @@ async def home():
                 <!-- Speech Translation Tab -->
                 <div id="translate" class="tab-content">
                     <div class="form-section">
-                        <h3>🌐 Speech Translation</h3>
+                        <h3>🌐 Speech Translate/Edit</h3>
                         <p style="color: #666; margin-bottom: 20px;">
-                            Upload source speech audio and specify the destination language. The system will transcribe,
-                            translate, and regenerate speech with the original timing and vocal characteristics.
+                            Upload source speech audio, pick a destination language, and optionally enter advanced mode to audition Gemini segments, tweak timings/text, and regenerate only the pieces you need.
                         </p>
                         <form id="translateForm" enctype="multipart/form-data">
                             <div class="form-group">
@@ -2125,6 +2441,23 @@ async def home():
                                     <option value="English">English</option>
                                     <option value="Chinese">Chinese</option>
                                 </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="translateGeminiModel">Gemini Model:</label>
+                                <select id="translateGeminiModel" name="gemini_model">
+                                    <option value="gemini-2.5-pro" selected>Gemini 2.5 Pro (highest accuracy)</option>
+                                    <option value="gemini-flash-latest">Gemini Flash Latest (fast)</option>
+                                </select>
+                                <small style="color: #666; display: block; margin-top: 6px;">
+                                    Choose the Gemini model used for transcription/translation. Flash is faster; Pro is more accurate.
+                                </small>
+                            </div>
+                            <div class="form-group">
+                                <label for="translateGeminiApiKey">Gemini API Key (optional):</label>
+                                <input type="password" id="translateGeminiApiKey" name="gemini_api_key" placeholder="Use this key instead of the system default..." autocomplete="off">
+                                <small style="color: #666; display: block; margin-top: 6px;">
+                                    Provide a key if the server environment does not have one configured or you need to override it for this request.
+                                </small>
                             </div>
                             <div class="form-group">
                                 <label for="translateOutputFormat">Output Format:</label>
@@ -2152,9 +2485,49 @@ async def home():
                                     Defaults to off. Requires the ClearVoice package to be installed.
                                 </small>
                             </div>
+                            <div class="form-group" style="margin-top: 20px;">
+                                <label style="display: flex; align-items: center; gap: 10px;">
+                                    <input type="checkbox" id="translateAdvancedMode">
+                                    <span>Enable advanced translate/edit workflow</span>
+                                </label>
+                                <small style="color: #666; margin-top: 6px; display: block;">
+                                    When enabled we will analyze segments first so you can listen, edit, and choose which parts to regenerate before final synthesis.
+                                </small>
+                            </div>
+                            <div id="translateAdvancedSettings" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px; margin-bottom: 20px;">
+                                <div class="form-group" style="margin-bottom: 16px;">
+                                    <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+                                        <input type="checkbox" id="translateDebugTranslate" checked>
+                                        <span>Ask Gemini to translate while transcribing</span>
+                                    </label>
+                                    <small style="color: #666; display: block;">
+                                        Uncheck to only transcribe with timestamps; you can enter translation text manually per segment.
+                                    </small>
+                                </div>
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label for="translateCustomPrompt">Custom Gemini Prompt (optional):</label>
+                                    <textarea id="translateCustomPrompt" rows="3" placeholder="Override the default Gemini prompt for segment analysis..."></textarea>
+                                    <small style="color: #666; margin-top: 6px; display: block;">
+                                        Leave blank to use the optimized defaults for translate/transcribe modes.
+                                    </small>
+                                </div>
+                            </div>
                             <button type="submit" class="btn" id="translateBtn">🌐 Translate Speech</button>
                         </form>
                         <div id="translateStatus" class="status"></div>
+                        <div id="translateAdvancedPanel" class="segment-panel" style="display: none;">
+                            <div class="segment-controls">
+                                <label class="segment-checkbox">
+                                    <input type="checkbox" id="translateSegmentsSelectAll" checked>
+                                    <span>Select all segments for generation</span>
+                                </label>
+                                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <button type="button" class="btn" id="translateGenerateBtn">🎧 Generate Selected Segments</button>
+                                </div>
+                            </div>
+                            <div id="translateSegmentsStatus" class="status"></div>
+                            <div id="translateSegmentsList" class="segment-list"></div>
+                        </div>
                         <div id="translateResult"></div>
                     </div>
                 </div>
@@ -2745,6 +3118,237 @@ async def home():
                 }
             });
 
+            const translateBtn = document.getElementById('translateBtn');
+            const translateAdvancedToggle = document.getElementById('translateAdvancedMode');
+            const translateAdvancedSettings = document.getElementById('translateAdvancedSettings');
+            const translateAdvancedPanel = document.getElementById('translateAdvancedPanel');
+            const translateSegmentsList = document.getElementById('translateSegmentsList');
+            const translateSegmentsStatus = document.getElementById('translateSegmentsStatus');
+            const translateSegmentsSelectAll = document.getElementById('translateSegmentsSelectAll');
+            const translateGenerateBtn = document.getElementById('translateGenerateBtn');
+            const translateDebugTranslate = document.getElementById('translateDebugTranslate');
+            const translateCustomPrompt = document.getElementById('translateCustomPrompt');
+            const translateGeminiModel = document.getElementById('translateGeminiModel');
+            const translateGeminiApiKey = document.getElementById('translateGeminiApiKey');
+            let currentTranslateSessionId = null;
+            let currentTranslateSegments = [];
+
+            function formatTimestamp(ms) {
+                const totalMs = Math.max(0, Math.round(ms || 0));
+                const minutes = Math.floor(totalMs / 60000);
+                const seconds = (totalMs % 60000) / 1000;
+                const secondsStr =
+                    seconds < 10
+                        ? `0${seconds.toFixed(3)}`.replace(/([.][0-9]*?[1-9])0+$/,'$1').replace(/[.]0+$/,'')
+                        : `${seconds.toFixed(3)}`.replace(/([.][0-9]*?[1-9])0+$/,'$1').replace(/[.]0+$/,'');
+                return `${String(minutes).padStart(2, '0')}:${secondsStr}`;
+            }
+
+            function setTranslateButtonLabel() {
+                if (!translateBtn) return;
+                if (translateAdvancedToggle && translateAdvancedToggle.checked) {
+                    translateBtn.textContent = '🧠 Analyze Segments';
+                } else {
+                    translateBtn.textContent = '🌐 Translate Speech';
+                }
+            }
+
+            function resetAdvancedPanel(clearSession = true) {
+                if (clearSession) {
+                    currentTranslateSessionId = null;
+                }
+                currentTranslateSegments = [];
+                if (translateAdvancedPanel) {
+                    translateAdvancedPanel.style.display = 'none';
+                }
+                if (translateSegmentsList) {
+                    translateSegmentsList.innerHTML = '';
+                }
+                if (translateSegmentsStatus) {
+                    hideStatus('translateSegmentsStatus');
+                }
+                if (translateSegmentsSelectAll) {
+                    translateSegmentsSelectAll.checked = true;
+                }
+            }
+
+            function updateTranslateSegmentsSummary() {
+                if (!translateSegmentsStatus) {
+                    return;
+                }
+                if (!translateSegmentsList) {
+                    hideStatus('translateSegmentsStatus');
+                    return;
+                }
+                const speechCards = translateSegmentsList.querySelectorAll('.segment-card.speech');
+                if (!speechCards.length) {
+                    hideStatus('translateSegmentsStatus');
+                    return;
+                }
+                let selected = 0;
+                speechCards.forEach(card => {
+                    const checkbox = card.querySelector('input.segment-generate');
+                    if (checkbox && checkbox.checked) {
+                        selected += 1;
+                    }
+                });
+                const preserved = speechCards.length - selected;
+                showStatus(
+                    `Selected ${selected}/${speechCards.length} speech segments • Preserving ${preserved}`,
+                    'success',
+                    'translateSegmentsStatus'
+                );
+                if (translateSegmentsSelectAll) {
+                    translateSegmentsSelectAll.checked = selected === speechCards.length;
+                }
+            }
+
+            function renderTranslateSegments(segments = []) {
+                if (!translateSegmentsList) {
+                    return;
+                }
+                translateSegmentsList.innerHTML = '';
+                const hasSpeech = segments.some(seg => seg.type === 'speech');
+                if (!segments.length) {
+                    translateSegmentsList.innerHTML = '<div class="segment-empty">No segments returned from Gemini.</div>';
+                    updateTranslateSegmentsSummary();
+                    return;
+                }
+                if (translateSegmentsSelectAll) {
+                    const allSelected = segments.filter(seg => seg.type === 'speech').every(seg => seg.generate !== false);
+                    translateSegmentsSelectAll.checked = allSelected;
+                }
+                segments.forEach(segment => {
+                    const startMsVal = Number.isFinite(segment.start_ms) ? segment.start_ms : 0;
+                    const endMsVal = Number.isFinite(segment.end_ms) ? segment.end_ms : startMsVal;
+                    const durationVal = Number.isFinite(segment.duration_ms)
+                        ? segment.duration_ms
+                        : Math.max(0, endMsVal - startMsVal);
+                    const card = document.createElement('div');
+                    card.className = `segment-card ${segment.type}`;
+                    card.dataset.index = segment.index;
+                    card.dataset.type = segment.type;
+
+                    const header = document.createElement('div');
+                    header.className = 'segment-header';
+
+                    const title = document.createElement('div');
+                    title.innerHTML = `<strong>#${segment.index}</strong> ${segment.type === 'speech' ? 'Speech Segment' : 'Silence Segment'}`;
+                    header.appendChild(title);
+
+                    if (segment.type === 'speech') {
+                        const checkboxLabel = document.createElement('label');
+                        checkboxLabel.className = 'segment-checkbox';
+                        const checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.className = 'segment-generate';
+                        checkbox.checked = segment.generate !== false;
+                        checkbox.addEventListener('change', updateTranslateSegmentsSummary);
+                        checkboxLabel.appendChild(checkbox);
+                        const span = document.createElement('span');
+                        span.textContent = 'Generate';
+                        checkboxLabel.appendChild(span);
+                        header.appendChild(checkboxLabel);
+                    } else {
+                        const meta = document.createElement('span');
+                        meta.className = 'segment-meta';
+                        meta.textContent = 'Preserved silence';
+                        header.appendChild(meta);
+                    }
+
+                    card.appendChild(header);
+
+                    const metaInfo = document.createElement('div');
+                    metaInfo.className = 'segment-meta';
+                    metaInfo.textContent = `${segment.start || formatTimestamp(startMsVal)} → ${segment.end || formatTimestamp(endMsVal)} (${durationVal} ms)`;
+                    card.appendChild(metaInfo);
+
+                    const body = document.createElement('div');
+                    body.className = 'segment-body';
+
+                    const timing = document.createElement('div');
+                    timing.className = 'segment-timing';
+                    timing.innerHTML = `
+                        <label>Start (ms)
+                            <input type="number" class="segment-start" value="${startMsVal}" min="0">
+                        </label>
+                        <label>End (ms)
+                            <input type="number" class="segment-end" value="${endMsVal}" min="0">
+                        </label>
+                        <div class="segment-duration-label">Duration: <span class="segment-duration">${durationVal}</span> ms</div>
+                    `;
+                    body.appendChild(timing);
+
+                    const startInput = timing.querySelector('.segment-start');
+                    const endInput = timing.querySelector('.segment-end');
+                    const durationLabel = timing.querySelector('.segment-duration');
+                    const updateDuration = () => {
+                        const startVal = parseInt(startInput.value || '0', 10);
+                        const endVal = parseInt(endInput.value || '0', 10);
+                        const diff = Math.max(0, endVal - startVal);
+                        durationLabel.textContent = diff;
+                    };
+                    startInput.addEventListener('input', updateDuration);
+                    endInput.addEventListener('input', updateDuration);
+
+                    if (segment.type === 'speech') {
+                        const sourceGroup = document.createElement('div');
+                        sourceGroup.innerHTML = `
+                            <label>Source Text</label>
+                            <textarea class="segment-source">${segment.source_text || ''}</textarea>
+                        `;
+                        body.appendChild(sourceGroup);
+
+                        const translationGroup = document.createElement('div');
+                        translationGroup.innerHTML = `
+                            <label>Translation Text</label>
+                            <textarea class="segment-translation">${segment.translated_text || ''}</textarea>
+                        `;
+                        body.appendChild(translationGroup);
+
+                        if (segment.audio_preview) {
+                            const audioEl = document.createElement('audio');
+                            audioEl.className = 'segment-audio';
+                            audioEl.controls = true;
+                            audioEl.src = segment.audio_preview;
+                            body.appendChild(audioEl);
+                        }
+                    }
+
+                    card.appendChild(body);
+                    translateSegmentsList.appendChild(card);
+                });
+                if (!hasSpeech) {
+                    translateSegmentsList.insertAdjacentHTML('beforeend', '<div class="segment-empty">No speech segments detected.</div>');
+                }
+                updateTranslateSegmentsSummary();
+            }
+
+            if (translateAdvancedToggle) {
+                translateAdvancedToggle.addEventListener('change', () => {
+                    if (translateAdvancedSettings) {
+                        translateAdvancedSettings.style.display = translateAdvancedToggle.checked ? 'block' : 'none';
+                    }
+                    if (!translateAdvancedToggle.checked) {
+                        resetAdvancedPanel();
+                    }
+                    setTranslateButtonLabel();
+                });
+                setTranslateButtonLabel();
+            }
+
+            if (translateSegmentsSelectAll && translateSegmentsList) {
+                translateSegmentsSelectAll.addEventListener('change', () => {
+                    const speechCheckboxes = translateSegmentsList.querySelectorAll('.segment-card.speech input.segment-generate');
+                    speechCheckboxes.forEach(cb => {
+                        cb.checked = translateSegmentsSelectAll.checked;
+                    });
+                    updateTranslateSegmentsSummary();
+                });
+            } else {
+                setTranslateButtonLabel();
+            }
+
             const translateForm = document.getElementById('translateForm');
             if (translateForm) {
                 translateForm.addEventListener('submit', async function(e) {
@@ -2755,9 +3359,9 @@ async def home():
                     const audioInput = document.getElementById('translateAudioFile');
                     const destInput = document.getElementById('translateDestLanguage');
                     const formatSelect = document.getElementById('translateOutputFormat');
-                    const translateBtn = document.getElementById('translateBtn');
 
                     hideStatus(statusId);
+                    hideStatus('translateSegmentsStatus');
                     resultDiv.innerHTML = '';
 
                     if (!audioInput.files || audioInput.files.length === 0) {
@@ -2773,17 +3377,130 @@ async def home():
 
                     const selectedFormat = (formatSelect.value || 'mp3').toLowerCase();
 
+                    const translateEnhanceEl = document.getElementById('translateEnhancement');
+                    const translateSuperEl = document.getElementById('translateSuperResolution');
+
+                    const advancedEnabled = translateAdvancedToggle && translateAdvancedToggle.checked;
+
+                    if (advancedEnabled) {
+                        resetAdvancedPanel();
+                        const formData = new FormData();
+                        formData.append('audio_file', audioInput.files[0]);
+                        formData.append('dest_language', destLanguage);
+                        formData.append('response_format', selectedFormat);
+                        formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
+                        formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                        if (translateGeminiModel && translateGeminiModel.value) {
+                            formData.append('gemini_model', translateGeminiModel.value);
+                        }
+                        if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
+                            formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
+                        }
+                        if (translateDebugTranslate) {
+                            formData.append('translate_text', translateDebugTranslate.checked ? 'true' : 'false');
+                        }
+                        const customPromptValue = translateCustomPrompt ? translateCustomPrompt.value.trim() : '';
+                        if (customPromptValue) {
+                            formData.append('prompt', customPromptValue);
+                        }
+
+                        try {
+                            if (translateBtn) {
+                                translateBtn.disabled = true;
+                            }
+                            showStatus('Analyzing audio and preparing editable segments... ⏳', 'success', statusId);
+
+                            const response = await fetch('/api/translate_segments', {
+                                method: 'POST',
+                                body: formData
+                            });
+
+                            const contentType = response.headers.get('Content-Type') || '';
+
+                            if (!response.ok) {
+                                let errorMessage = `Segment preparation failed (${response.status})`;
+                                if (contentType.includes('application/json')) {
+                                    try {
+                                        const errorData = await response.json();
+                                        errorMessage = errorData.message || errorData.error || errorMessage;
+                                    } catch (jsonError) {
+                                        console.warn('Failed to parse error response:', jsonError);
+                                    }
+                                }
+                                showStatus(errorMessage, 'error', statusId);
+                                return;
+                            }
+
+                            if (!contentType.includes('application/json')) {
+                                showStatus('Segment preparation failed: unexpected response format.', 'error', statusId);
+                                return;
+                            }
+
+                            const data = await response.json();
+                            if (data.status !== 'success' || !data.session_id) {
+                                const message = data.message || data.error || 'Failed to prepare segments.';
+                                showStatus(message, 'error', statusId);
+                                return;
+                            }
+
+                            currentTranslateSessionId = data.session_id;
+                            if (data.metadata && data.metadata.gemini_model && translateGeminiModel) {
+                                translateGeminiModel.value = data.metadata.gemini_model;
+                            }
+                            const translateEnabledNow = translateDebugTranslate ? translateDebugTranslate.checked : true;
+                            currentTranslateSegments = Array.isArray(data.segments)
+                                ? data.segments.map(seg => ({
+                                      ...seg,
+                                      generate: translateEnabledNow ? seg.generate !== false : false,
+                                  }))
+                                : [];
+                            renderTranslateSegments(currentTranslateSegments);
+                            if (translateAdvancedPanel) {
+                                translateAdvancedPanel.style.display = 'block';
+                            }
+
+                            const speechCount =
+                                (data.metadata && data.metadata.speech_segment_count) ||
+                                currentTranslateSegments.filter(seg => seg.type === 'speech').length;
+                            const totalCount = currentTranslateSegments.length;
+                            let statusMessage = `✅ Segments ready: ${totalCount}`;
+                            if (typeof speechCount === 'number') {
+                                statusMessage += ` total • ${speechCount} speech`;
+                            }
+                            showStatus(`${statusMessage}. Review below and choose segments to regenerate.`, 'success', statusId);
+                            if (!currentTranslateSegments.length) {
+                                showStatus('No segments detected. Try adjusting the audio or prompt.', 'error', 'translateSegmentsStatus');
+                            }
+                        } catch (error) {
+                            console.error('Segment preparation error:', error);
+                            showStatus(`Segment preparation error: ${error.message}`, 'error', statusId);
+                        } finally {
+                            if (translateBtn) {
+                                translateBtn.disabled = false;
+                            }
+                        }
+                        return;
+                    } else {
+                        resetAdvancedPanel();
+                    }
+
                     const formData = new FormData();
                     formData.append('audio_file', audioInput.files[0]);
                     formData.append('dest_language', destLanguage);
                     formData.append('response_format', selectedFormat);
-                    const translateEnhanceEl = document.getElementById('translateEnhancement');
-                    const translateSuperEl = document.getElementById('translateSuperResolution');
                     formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                     formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                    if (translateGeminiModel && translateGeminiModel.value) {
+                        formData.append('gemini_model', translateGeminiModel.value);
+                    }
+                    if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
+                        formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
+                    }
 
                     try {
-                        translateBtn.disabled = true;
+                        if (translateBtn) {
+                            translateBtn.disabled = true;
+                        }
                         showStatus('Translating speech... this may take a moment ⏳', 'success', statusId);
 
                         const response = await fetch('/api/translate_audio', {
@@ -2842,7 +3559,183 @@ async def home():
                         console.error('Translation error:', error);
                         showStatus(`Translation error: ${error.message}`, 'error', statusId);
                     } finally {
-                        translateBtn.disabled = false;
+                        if (translateBtn) {
+                            translateBtn.disabled = false;
+                        }
+                    }
+                });
+            }
+
+            if (translateGenerateBtn) {
+                translateGenerateBtn.addEventListener('click', async () => {
+                    const statusId = 'translateStatus';
+                    const resultDiv = document.getElementById('translateResult');
+                    hideStatus('translateSegmentsStatus');
+
+                    if (!currentTranslateSessionId) {
+                        showStatus('Analyze audio first to load segments.', 'error', 'translateSegmentsStatus');
+                        return;
+                    }
+                    if (!translateSegmentsList) {
+                        showStatus('Segment list unavailable.', 'error', 'translateSegmentsStatus');
+                        return;
+                    }
+                    const segmentCards = translateSegmentsList.querySelectorAll('.segment-card');
+                    if (!segmentCards.length) {
+                        showStatus('No segments to generate.', 'error', 'translateSegmentsStatus');
+                        return;
+                    }
+
+                    const segmentsPayload = [];
+                    let hasError = false;
+
+                    segmentCards.forEach(card => {
+                        if (hasError) {
+                            return;
+                        }
+                        const index = parseInt(card.dataset.index, 10);
+                        const type = card.dataset.type || 'speech';
+                        const startInput = card.querySelector('.segment-start');
+                        const endInput = card.querySelector('.segment-end');
+                        const startMs = parseInt(startInput ? startInput.value : '0', 10);
+                        const endMs = parseInt(endInput ? endInput.value : '0', 10);
+                        if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+                            showStatus(`Segment #${index}: invalid timing.`, 'error', 'translateSegmentsStatus');
+                            hasError = true;
+                            return;
+                        }
+                        if (endMs <= startMs) {
+                            showStatus(`Segment #${index}: end time must be greater than start time.`, 'error', 'translateSegmentsStatus');
+                            hasError = true;
+                            return;
+                        }
+                        let generate = false;
+                        let sourceText = '';
+                        let translatedText = '';
+                        if (type === 'speech') {
+                            const checkbox = card.querySelector('input.segment-generate');
+                            generate = checkbox ? checkbox.checked : true;
+                            const sourceInput = card.querySelector('.segment-source');
+                            const translationInput = card.querySelector('.segment-translation');
+                            sourceText = sourceInput ? sourceInput.value : '';
+                            translatedText = translationInput ? translationInput.value : '';
+                        }
+
+                        segmentsPayload.push({
+                            index,
+                            type,
+                            start_ms: startMs,
+                            end_ms: endMs,
+                            generate,
+                            source_text: sourceText,
+                            translated_text: translatedText,
+                        });
+                    });
+
+                    if (hasError || !segmentsPayload.length) {
+                        return;
+                    }
+
+                    const formatSelect = document.getElementById('translateOutputFormat');
+                    const selectedFormat = (formatSelect && formatSelect.value ? formatSelect.value : 'mp3').toLowerCase();
+
+                    const payload = {
+                        session_id: currentTranslateSessionId,
+                        segments: segmentsPayload,
+                        response_format: selectedFormat,
+                    };
+
+                    try {
+                        translateGenerateBtn.disabled = true;
+                        showStatus('Generating selected segments... 🎧', 'success', statusId);
+
+                        const response = await fetch('/api/translate_generate_segments', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(payload),
+                        });
+
+                        const contentType = response.headers.get('Content-Type') || '';
+
+                        if (!response.ok) {
+                            let errorMessage = `Generation failed (${response.status})`;
+                            if (contentType.includes('application/json')) {
+                                try {
+                                    const errorData = await response.json();
+                                    errorMessage = errorData.message || errorData.error || errorMessage;
+                                } catch (jsonError) {
+                                    console.warn('Failed to parse error response:', jsonError);
+                                }
+                            }
+                            showStatus(errorMessage, 'error', 'translateSegmentsStatus');
+                            showStatus(errorMessage, 'error', statusId);
+                            return;
+                        }
+
+                        if (contentType.startsWith('audio/')) {
+                            const blob = await response.blob();
+                            const audioUrl = URL.createObjectURL(blob);
+                            const downloadName = `translated_speech.${selectedFormat}`;
+
+                            if (resultDiv) {
+                                resultDiv.innerHTML = `
+                                    <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
+                                    <div style="margin-top: 12px;">
+                                        <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
+                                    </div>
+                                `;
+                            }
+
+                            const generatedHeader = parseInt(response.headers.get('X-Translation-Generated') || '0', 10);
+                            const preservedHeader = parseInt(response.headers.get('X-Translation-Preserved') || '0', 10);
+                            const segmentHeader = response.headers.get('X-Translation-Segments');
+                            let statusMessage = '✅ Advanced translation complete!';
+                            if (segmentHeader) {
+                                statusMessage += ` (${segmentHeader} segments)`;
+                            }
+                            if (!Number.isNaN(generatedHeader) && !Number.isNaN(preservedHeader)) {
+                                statusMessage += ` • Generated ${generatedHeader}, preserved ${preservedHeader}`;
+                            }
+                            showStatus(statusMessage, 'success', statusId);
+                            showStatus(`Generated ${generatedHeader} segments • Preserved ${preservedHeader}`, 'success', 'translateSegmentsStatus');
+
+                            const segmentMap = new Map(segmentsPayload.map(seg => [seg.index, seg]));
+                            currentTranslateSegments = currentTranslateSegments.map(seg => {
+                                const updated = segmentMap.get(seg.index);
+                                if (!updated) {
+                                    return seg;
+                                }
+                                const duration = Math.max(0, updated.end_ms - updated.start_ms);
+                                return {
+                                    ...seg,
+                                    start_ms: updated.start_ms,
+                                    end_ms: updated.end_ms,
+                                    duration_ms: duration,
+                                    start: formatTimestamp(updated.start_ms),
+                                    end: formatTimestamp(updated.end_ms),
+                                    source_text: updated.source_text || '',
+                                    translated_text: updated.translated_text || '',
+                                    generate: updated.generate,
+                                };
+                            });
+                            renderTranslateSegments(currentTranslateSegments);
+                        } else {
+                            try {
+                                const data = await response.json();
+                                const message = data.message || data.error || 'Generation failed.';
+                                showStatus(message, 'error', 'translateSegmentsStatus');
+                                showStatus(message, 'error', statusId);
+                            } catch (parseError) {
+                                showStatus('Generation failed: unexpected response format.', 'error', 'translateSegmentsStatus');
+                                showStatus('Generation failed: unexpected response format.', 'error', statusId);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Segment generation error:', error);
+                        showStatus(`Segment generation error: ${error.message}`, 'error', 'translateSegmentsStatus');
+                        showStatus(`Segment generation error: ${error.message}`, 'error', statusId);
+                    } finally {
+                        translateGenerateBtn.disabled = false;
                     }
                 });
             }
@@ -3295,6 +4188,408 @@ async def api_clear_outputs():
         }
 
 
+@app.post("/api/translate_segments")
+async def api_translate_segments(
+    request: Request,
+    dest_language: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    bitrate: Optional[str] = Form(None),
+    audio: Optional[str] = Form(None),
+    audio_mime_type: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    translate_text: Optional[bool] = Form(True),
+    gemini_model: Optional[str] = Form(None),
+    gemini_api_key: Optional[str] = Form(None),
+    enhance_voice: Optional[bool] = Form(False),
+    super_resolution_voice: Optional[bool] = Form(False),
+    audio_file: Optional[UploadFile] = File(None),
+):
+    """API: Prepare translation segments for advanced translate/edit workflow."""
+    try:
+        payload: Optional[Dict[str, Any]] = None
+        dest_language_value = dest_language
+        response_format_value = response_format
+        bitrate_value = bitrate
+        audio_reference = audio
+        audio_mime_type_value = audio_mime_type
+        prompt_override = prompt
+        translate_flag_value = translate_text
+        gemini_model_value = gemini_model
+        gemini_api_key_value = gemini_api_key
+        enhance_voice_value = enhance_voice
+        super_resolution_voice_value = super_resolution_voice
+
+        content_type = request.headers.get("content-type", "")
+        if (
+            dest_language is None
+            and not audio_reference
+            and audio_file is None
+            and "application/json" in content_type.lower()
+        ):
+            try:
+                payload = await request.json()
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
+                )
+
+        if payload is not None:
+            dest_language_value = payload.get("dest_language", dest_language_value)
+            response_format_value = payload.get("response_format", response_format_value)
+            bitrate_value = payload.get("bitrate", bitrate_value)
+            audio_reference = payload.get("audio", audio_reference)
+            audio_mime_type_value = payload.get("audio_mime_type", audio_mime_type_value)
+            prompt_override = payload.get("prompt", prompt_override)
+            translate_flag_value = payload.get("translate", translate_flag_value)
+            gemini_model_value = payload.get("gemini_model", gemini_model_value)
+            gemini_api_key_value = payload.get("gemini_api_key", gemini_api_key_value)
+            enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
+            super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
+
+        dest_language_value = (dest_language_value or "").strip()
+        if not dest_language_value:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Destination language (dest_language) is required."},
+            )
+
+        response_format_value = (response_format_value or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
+        allowed_formats = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
+        if response_format_value not in allowed_formats:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": f"Unsupported response_format '{response_format_value}'. Allowed: {', '.join(sorted(allowed_formats))}",
+                },
+            )
+
+        bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
+        translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
+        apply_enhancement = _coerce_to_bool(enhance_voice_value)
+        apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
+        gemini_model_value = (gemini_model_value or "").strip()
+        if gemini_model_value and gemini_model_value not in allowed_gemini_models:
+            gemini_model_value = ""
+        resolved_gemini_model = gemini_model_value or _get_gemini_model_name()
+        gemini_api_key_value = (gemini_api_key_value or "").strip()
+
+        audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+        if audio_io is None:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "No audio provided for translation."},
+            )
+
+        audio_bytes = audio_io.read()
+        if not audio_bytes:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Provided audio data is empty."},
+            )
+
+        input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
+        audio_format = _guess_audio_format_from_mime(input_mime_type)
+
+        try:
+            audio_buffer = BytesIO(audio_bytes)
+            if audio_format:
+                original_audio = AudioSegment.from_file(audio_buffer, format=audio_format)
+            else:
+                original_audio = AudioSegment.from_file(audio_buffer)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
+            )
+
+        processed_paths: Set[str] = set()
+        if apply_enhancement or apply_super_resolution:
+            if ClearVoice is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "message": "ClearVoice package is required for enhancement or super-resolution.",
+                    },
+                )
+
+            temp_input_path = None
+            final_processed_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
+                    original_audio.export(tmp_input.name, format="wav")
+                    temp_input_path = tmp_input.name
+                processed_paths.add(temp_input_path)
+
+                final_processed_path, clearvoice_paths = await apply_clearvoice_processing(
+                    temp_input_path,
+                    apply_enhancement,
+                    apply_super_resolution,
+                )
+                processed_paths.update(clearvoice_paths)
+                processed_paths.add(final_processed_path)
+
+                original_audio = AudioSegment.from_file(final_processed_path, format="wav")
+            except Exception as cv_error:
+                for path in processed_paths:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                return JSONResponse(
+                    status_code=500,
+                    content={"status": "error", "message": f"ClearVoice processing failed: {str(cv_error)}"},
+                )
+            finally:
+                for path in processed_paths:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+        with BytesIO() as processed_buffer:
+            original_audio.export(processed_buffer, format="wav")
+            processed_audio_bytes = processed_buffer.getvalue()
+        gemini_mime_type = "audio/wav"
+
+        final_prompt = (prompt_override or "").strip()
+        if not final_prompt:
+            if translate_enabled:
+                final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
+            else:
+                final_prompt = TRANSCRIPTION_PROMPT_TEMPLATE
+
+        gemini_chunks = await _gemini_transcribe_translate(
+            processed_audio_bytes,
+            gemini_mime_type,
+            dest_language_value,
+            final_prompt,
+            model_name=resolved_gemini_model,
+            api_key_override=gemini_api_key_value or None,
+        )
+        segments = _prepare_translation_segments(original_audio, gemini_chunks, dest_language_value)
+
+        if not translate_enabled:
+            for segment in segments:
+                if segment.get("type") != "speech":
+                    continue
+                translated_text = (segment.get("translated_text") or "").strip()
+                source_text = (segment.get("source_text") or "").strip()
+                if not translated_text and source_text:
+                    segment["translated_text"] = source_text
+
+        session = await _create_translate_session(
+            original_audio,
+            dest_language_value,
+            final_prompt,
+            translate_enabled,
+            response_format_value,
+            bitrate_value,
+            input_mime_type,
+            {
+                "enhancement": apply_enhancement,
+                "super_resolution": apply_super_resolution,
+            },
+            segments,
+            gemini_chunks,
+            resolved_gemini_model,
+            gemini_api_key_value or None,
+        )
+        ui_segments = _serialize_segments_for_ui(segments, original_audio)
+
+        metadata = {
+            "dest_language": dest_language_value,
+            "segment_count": len(segments),
+            "speech_segment_count": sum(1 for seg in segments if seg.get("type") == "speech"),
+            "silence_segment_count": sum(1 for seg in segments if seg.get("type") == "silence"),
+            "audio_duration_ms": len(original_audio),
+            "translate_enabled": translate_enabled,
+            "response_format": response_format_value,
+            "bitrate": bitrate_value,
+            "prompt": final_prompt,
+            "gemini_model": resolved_gemini_model,
+            "clearvoice": {
+                "enhancement": apply_enhancement,
+                "super_resolution": apply_super_resolution,
+            },
+        }
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "session_id": session.session_id,
+                "segments": ui_segments,
+                "metadata": metadata,
+            }
+        )
+    except RuntimeError as runtime_error:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(runtime_error)},
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to prepare translation segments: {str(exc)}"},
+        )
+
+
+@app.post("/api/translate_generate_segments")
+async def api_translate_generate_segments(payload: TranslateGenerateRequest):
+    """API: Generate translated audio from edited segments."""
+    try:
+        session = await _get_translate_session(payload.session_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "Translate session not found or expired."},
+            )
+
+        allowed_formats = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
+        response_format_value = (
+            payload.response_format or session.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT
+        ).lower()
+        if response_format_value not in allowed_formats:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": f"Unsupported response_format '{response_format_value}'. Allowed: {', '.join(sorted(allowed_formats))}",
+                },
+            )
+
+        bitrate_value = payload.bitrate or session.bitrate or TRANSLATE_DEFAULT_BITRATE
+        max_duration = len(session.original_audio)
+        base_segment_map = {seg.get("index"): seg for seg in session.base_segments}
+
+        final_segments: List[Dict[str, Any]] = []
+        sanitized_segments: List[Dict[str, Any]] = []
+
+        for seg_input in payload.segments:
+            start_ms = max(0, int(seg_input.start_ms))
+            end_ms = max(0, int(seg_input.end_ms))
+            if end_ms > max_duration:
+                end_ms = max_duration
+            if end_ms <= start_ms:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": f"Segment index {seg_input.index} has invalid timing (end <= start).",
+                    },
+                )
+            duration_ms = end_ms - start_ms
+            start_label = _format_ms_to_timestamp(start_ms)
+            end_label = _format_ms_to_timestamp(end_ms)
+            translated_text = (seg_input.translated_text or "").strip()
+            source_text = (seg_input.source_text or "").strip()
+
+            is_speech = seg_input.type == "speech"
+            generate_flag = bool(seg_input.generate) if is_speech else False
+            keep_original = not generate_flag if is_speech else True
+
+            segment_payload: Dict[str, Any] = {
+                "index": seg_input.index,
+                "type": seg_input.type,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "duration_ms": duration_ms,
+                "start": start_label,
+                "end": end_label,
+                "source_text": source_text,
+                "translated_text": translated_text,
+                "generate": generate_flag if is_speech else False,
+                "keep_original": keep_original,
+            }
+
+            base_info = base_segment_map.get(seg_input.index)
+            if base_info and base_info.get("text_keys"):
+                segment_payload["text_keys"] = base_info["text_keys"]
+
+            final_segments.append(segment_payload)
+
+            sanitized_segment: Dict[str, Any] = {
+                "index": seg_input.index,
+                "type": seg_input.type,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "duration_ms": duration_ms,
+                "start": start_label,
+                "end": end_label,
+                "source_text": source_text,
+                "translated_text": translated_text,
+            }
+            if base_info and base_info.get("text_keys"):
+                sanitized_segment["text_keys"] = base_info["text_keys"]
+            sanitized_segments.append(sanitized_segment)
+
+        final_segments.sort(key=lambda seg: (int(seg.get("start_ms", 0)), int(seg.get("index", 0))))
+        sanitized_segments.sort(key=lambda seg: (int(seg.get("start_ms", 0)), int(seg.get("index", 0))))
+
+        audio_payload, media_type, metadata = await _synthesize_translated_audio(
+            session.original_audio,
+            final_segments,
+            session.dest_language,
+            response_format=response_format_value,
+            bitrate=bitrate_value,
+            input_mime_type=session.input_mime_type,
+            clearvoice_settings=session.clearvoice_settings,
+        )
+
+        generated_count = sum(
+            1 for seg in final_segments if seg.get("type") == "speech" and not seg.get("keep_original", False)
+        )
+        preserved_count = sum(
+            1 for seg in final_segments if seg.get("type") == "speech" and seg.get("keep_original", False)
+        )
+
+        metadata["selected_generated_count"] = generated_count
+        metadata["selected_preserved_count"] = preserved_count
+        metadata["session_id"] = session.session_id
+        metadata["gemini_model"] = session.gemini_model or _get_gemini_model_name()
+
+        await _update_translate_session_segments(session.session_id, sanitized_segments)
+        await _update_translate_session_metadata(
+            session.session_id,
+            response_format=response_format_value,
+            bitrate=bitrate_value,
+            gemini_model=session.gemini_model,
+        )
+
+        headers = {
+            "Content-Disposition": f"attachment; filename=translated_speech.{response_format_value}",
+            "X-Translation-Model": session.gemini_model or _get_gemini_model_name(),
+            "X-Translation-Segments": str(len(final_segments)),
+            "X-Translation-Generated": str(generated_count),
+            "X-Translation-Preserved": str(preserved_count),
+            "X-Translation-Input-Mime": session.input_mime_type or "",
+            "X-Translate-Session": session.session_id,
+        }
+        clearvoice_settings = session.clearvoice_settings or {}
+        if clearvoice_settings:
+            headers["X-Translation-ClearVoice"] = (
+                f"enhancement={str(clearvoice_settings.get('enhancement', False)).lower()};"
+                f"super_resolution={str(clearvoice_settings.get('super_resolution', False)).lower()}"
+            )
+
+        return Response(content=audio_payload, media_type=media_type, headers=headers)
+    except RuntimeError as runtime_error:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(runtime_error)},
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to synthesize translation: {str(exc)}"},
+        )
+
+
 @app.post("/api/translate_audio")
 async def api_translate_audio(
     request: Request,
@@ -3304,6 +4599,8 @@ async def api_translate_audio(
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
+    gemini_model: Optional[str] = Form(None),
+    gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
     audio_file: Optional[UploadFile] = File(None),
@@ -3317,6 +4614,8 @@ async def api_translate_audio(
         prompt_override = prompt
         response_format_value = response_format
         bitrate_value = bitrate
+        gemini_model_value = gemini_model
+        gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
 
@@ -3349,6 +4648,8 @@ async def api_translate_audio(
             prompt_override = translate_req.prompt or prompt_override
             response_format_value = translate_req.response_format or response_format_value
             bitrate_value = translate_req.bitrate or bitrate_value
+            gemini_model_value = translate_req.gemini_model or gemini_model_value
+            gemini_api_key_value = translate_req.gemini_api_key or gemini_api_key_value
             enhance_voice_value = translate_req.enhance_voice if translate_req.enhance_voice is not None else enhance_voice_value
             super_resolution_voice_value = (
                 translate_req.super_resolution_voice if translate_req.super_resolution_voice is not None else super_resolution_voice_value
@@ -3375,6 +4676,12 @@ async def api_translate_audio(
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
+        gemini_model_value = (gemini_model_value or "").strip()
+        if gemini_model_value and gemini_model_value not in allowed_gemini_models:
+            gemini_model_value = ""
+        resolved_gemini_model = gemini_model_value or _get_gemini_model_name()
+        gemini_api_key_value = (gemini_api_key_value or "").strip()
 
         audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
         if audio_io is None:
@@ -3459,7 +4766,14 @@ async def api_translate_audio(
         if not final_prompt:
             final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
 
-        gemini_chunks = await _gemini_transcribe_translate(processed_audio_bytes, gemini_mime_type, dest_language_value, final_prompt)
+        gemini_chunks = await _gemini_transcribe_translate(
+            processed_audio_bytes,
+            gemini_mime_type,
+            dest_language_value,
+            final_prompt,
+            model_name=resolved_gemini_model,
+            api_key_override=gemini_api_key_value or None,
+        )
         segments = _prepare_translation_segments(original_audio, gemini_chunks, dest_language_value)
 
         audio_payload, media_type, metadata = await _synthesize_translated_audio(
@@ -3475,9 +4789,11 @@ async def api_translate_audio(
             },
         )
 
+        metadata["gemini_model"] = resolved_gemini_model
+
         headers = {
             "Content-Disposition": f"attachment; filename=translated_speech.{response_format_value}",
-            "X-Translation-Model": _get_gemini_model_name(),
+            "X-Translation-Model": resolved_gemini_model,
             "X-Translation-Segments": str(metadata.get("segment_count", len(segments))),
             "X-Translation-Speech-Segments": str(metadata.get("speech_segment_count", 0)),
             "X-Translation-Silence-Segments": str(metadata.get("silence_segment_count", 0)),
@@ -3488,7 +4804,8 @@ async def api_translate_audio(
         print(
             f"✅ Translation complete: {metadata.get('segment_count', len(segments))} segments "
             f"({metadata.get('speech_segment_count', 0)} speech / {metadata.get('silence_segment_count', 0)} silence), "
-            f"dest_language={dest_language_value}, format={response_format_value}, input_mime={input_mime_type}"
+            f"dest_language={dest_language_value}, format={response_format_value}, input_mime={input_mime_type}, "
+            f"gemini_model={resolved_gemini_model}"
         )
 
         return Response(content=audio_payload, media_type=media_type, headers=headers)
@@ -4167,6 +5484,9 @@ if __name__ == "__main__":
     print(f"   - Modern web interface with Chinese support")
     print(f"   - MP3 output for smaller file sizes")
     print(f"   - High concurrency support (100 concurrent connections)")
+    print(f"   - Advanced translate/edit mode with segment editing")
+    print(f"   - Gemini model selection (Flash vs Pro) with API key override")
+    print(f"   - Per-segment generation control for efficient processing")
     
     uvicorn.run(
         app,
