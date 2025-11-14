@@ -75,6 +75,10 @@ import argparse
 # Global thread executor for blocking operations
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fastapi_async")
 
+# Global ClearVoice models (initialized lazily and reused)
+_enhancement_model: Optional[Any] = None
+_super_res_model: Optional[Any] = None
+
 # Gemini configuration
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
@@ -128,6 +132,8 @@ class TranslateSessionData:
     gemini_chunks: List[Dict[str, Any]]
     gemini_model: str
     gemini_api_key: Optional[str]
+    backing_track_audio: Optional[AudioSegment] = None
+    merge_with_backing: bool = False
     created_at: float = field(default_factory=lambda: time.time())
 
 
@@ -446,42 +452,113 @@ def _append_suffix_to_path(file_path: str, suffix: str) -> str:
     return str(path_obj.with_name(f"{path_obj.stem}{suffix}{path_obj.suffix}"))
 
 
+def _extract_backing_track_from_vocals(
+    original_mix: AudioSegment,
+    enhanced_vocals: AudioSegment,
+) -> Optional[AudioSegment]:
+    """
+    Approximate an instrumental backing track by subtracting the ClearVoice
+    MossFormer2 vocals estimate from the original mixture.
+    """
+    if original_mix is None or enhanced_vocals is None:
+        return None
+
+    try:
+        target_rate = int(original_mix.frame_rate or enhanced_vocals.frame_rate or 44100)
+        target_channels = int(original_mix.channels or enhanced_vocals.channels or 1)
+        target_sample_width = 2  # work in int16 space for predictable clipping
+
+        mix_aligned = (
+            original_mix.set_frame_rate(target_rate)
+            .set_channels(target_channels)
+            .set_sample_width(target_sample_width)
+        )
+        vocals_aligned = (
+            enhanced_vocals.set_frame_rate(target_rate)
+            .set_channels(target_channels)
+            .set_sample_width(target_sample_width)
+        )
+
+        mix_samples = np.array(mix_aligned.get_array_of_samples(), dtype=np.float32)
+        vocal_samples = np.array(vocals_aligned.get_array_of_samples(), dtype=np.float32)
+
+        if target_channels > 1:
+            mix_samples = mix_samples.reshape((-1, target_channels))
+            vocal_samples = vocal_samples.reshape((-1, target_channels))
+
+        min_len = min(len(mix_samples), len(vocal_samples))
+        if min_len == 0:
+            return None
+
+        residual = np.copy(mix_samples)
+        residual[:min_len] = mix_samples[:min_len] - vocal_samples[:min_len]
+        if len(mix_samples) > min_len:
+            residual[min_len:] = mix_samples[min_len:]
+
+        clip_min = np.iinfo(np.int16).min
+        clip_max = np.iinfo(np.int16).max
+        residual = np.clip(residual, clip_min, clip_max).astype(np.int16)
+
+        if target_channels > 1:
+            residual = residual.reshape(-1)
+
+        return AudioSegment(
+            residual.tobytes(),
+            frame_rate=target_rate,
+            sample_width=target_sample_width,
+            channels=target_channels,
+        )
+    except Exception as exc:
+        print(f"⚠️ Failed to extract backing track from ClearVoice output: {exc}")
+        return None
+
+
 def _apply_clearvoice_processing_sync(
     input_path: str,
     apply_enhancement: bool,
     apply_super_resolution: bool,
-) -> Tuple[str, List[str]]:
+) -> Tuple[str, List[str], Optional[str]]:
     """Run ClearVoice enhancement/super-resolution synchronously."""
+    global _enhancement_model, _super_res_model
+    
     if ClearVoice is None:
         raise RuntimeError("ClearVoice package is not available in the environment.")
     
     generated_paths: List[str] = []
+    enhancement_output_path: Optional[str] = None
     current_input = input_path
     final_path = input_path
     
     try:
         if apply_enhancement:
             print("✨ ClearVoice: Applying MossFormer2_SE_48K enhancement...")
-            enhancement_model = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
-            enhancement_output = enhancement_model(input_path=current_input, online_write=False)
+            # Initialize enhancement model if not already created
+            if _enhancement_model is None:
+                print("🔧 Initializing enhancement model (first use)...")
+                _enhancement_model = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
+            enhancement_output = _enhancement_model(input_path=current_input, online_write=False)
             enhanced_path = _append_suffix_to_path(current_input, "_se")
-            enhancement_model.write(enhancement_output, output_path=enhanced_path)
+            _enhancement_model.write(enhancement_output, output_path=enhanced_path)
             generated_paths.append(enhanced_path)
             final_path = enhanced_path
             current_input = enhanced_path
+            enhancement_output_path = enhanced_path
             print(f"✅ ClearVoice: Enhancement saved to {os.path.basename(enhanced_path)}")
         
         if apply_super_resolution:
             print("🎛️ ClearVoice: Applying MossFormer2_SR_48K super-resolution...")
-            super_res_model = ClearVoice(task="speech_super_resolution", model_names=["MossFormer2_SR_48K"])
-            super_res_output = super_res_model(input_path=current_input, online_write=False)
+            # Initialize super-resolution model if not already created
+            if _super_res_model is None:
+                print("🔧 Initializing super-resolution model (first use)...")
+                _super_res_model = ClearVoice(task="speech_super_resolution", model_names=["MossFormer2_SR_48K"])
+            super_res_output = _super_res_model(input_path=current_input, online_write=False)
             super_res_path = _append_suffix_to_path(current_input, "_sr")
-            super_res_model.write(super_res_output, output_path=super_res_path)
+            _super_res_model.write(super_res_output, output_path=super_res_path)
             generated_paths.append(super_res_path)
             final_path = super_res_path
             print(f"✅ ClearVoice: Super-resolution saved to {os.path.basename(super_res_path)}")
         
-        return final_path, generated_paths
+        return final_path, generated_paths, enhancement_output_path
     except Exception:
         for created_path in generated_paths:
             try:
@@ -495,7 +572,7 @@ async def apply_clearvoice_processing(
     input_path: str,
     apply_enhancement: bool,
     apply_super_resolution: bool,
-) -> Tuple[str, List[str]]:
+) -> Tuple[str, List[str], Optional[str]]:
     """Async wrapper for ClearVoice processing."""
     if not (apply_enhancement or apply_super_resolution):
         return input_path, []
@@ -983,6 +1060,8 @@ async def _create_translate_session(
     gemini_chunks: List[Dict[str, Any]],
     gemini_model: str,
     gemini_api_key: Optional[str],
+    backing_track_audio: Optional[AudioSegment] = None,
+    merge_with_backing: bool = False,
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
     session = TranslateSessionData(
@@ -999,6 +1078,8 @@ async def _create_translate_session(
         gemini_chunks=copy.deepcopy(gemini_chunks),
         gemini_model=gemini_model,
         gemini_api_key=gemini_api_key,
+        backing_track_audio=backing_track_audio,
+        merge_with_backing=merge_with_backing,
     )
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         _cleanup_expired_translate_sessions_locked()
@@ -1256,6 +1337,8 @@ async def _synthesize_translated_audio(
     bitrate: str = TRANSLATE_DEFAULT_BITRATE,
     input_mime_type: Optional[str] = None,
     clearvoice_settings: Optional[Dict[str, bool]] = None,
+    backing_track_audio: Optional[AudioSegment] = None,
+    merge_with_backing: bool = False,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -1381,6 +1464,26 @@ async def _synthesize_translated_audio(
     if final_duration_ms < original_duration_ms:
         combined_audio += _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
 
+    backing_applied = False
+    if merge_with_backing and backing_track_audio is not None:
+        try:
+            prepared_backing = (
+                backing_track_audio.set_frame_rate(frame_rate)
+                .set_sample_width(sample_width)
+                .set_channels(channels)
+            )
+            prepared_backing = _match_segment_duration(
+                prepared_backing,
+                len(combined_audio),
+                frame_rate,
+                sample_width,
+                channels,
+            )
+            combined_audio = prepared_backing.overlay(combined_audio)
+            backing_applied = True
+        except Exception as merge_error:
+            print(f"⚠️ Failed to merge translated audio with backing track: {merge_error}")
+
     buffer = BytesIO()
     export_kwargs: Dict[str, Any] = {}
     audio_format = (response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
@@ -1413,6 +1516,10 @@ async def _synthesize_translated_audio(
         metadata["input_mime_type"] = input_mime_type
     if clearvoice_settings:
         metadata["clearvoice"] = clearvoice_settings
+    metadata["backing_track"] = {
+        "available": backing_track_audio is not None,
+        "merged": backing_applied,
+    }
 
     return audio_bytes, media_type, metadata
 
@@ -1626,7 +1733,7 @@ class SpeakerAPIWrapper:
                 
                 if clearvoice_requested:
                     try:
-                        final_audio_path, clearvoice_paths = await apply_clearvoice_processing(
+                        final_audio_path, clearvoice_paths, _ = await apply_clearvoice_processing(
                             final_audio_path,
                             apply_enhancement,
                             apply_super_resolution,
@@ -1793,6 +1900,10 @@ class TranslateRequest(BaseModel):
         default=False,
         description="Apply ClearVoice MossFormer2_SR_48K super-resolution before translation.",
     )
+    merge_backing_track: Optional[bool] = Field(
+        default=False,
+        description="When enabled, mix the regenerated speech back onto an instrumental backing track extracted during ClearVoice enhancement.",
+    )
     gemini_model: Optional[str] = Field(
         default=None,
         description="Override the Gemini model used for transcription/translation.",
@@ -1820,6 +1931,10 @@ class TranslateGenerateRequest(BaseModel):
         default=None, description="Desired audio format for output. Defaults to the original request value."
     )
     bitrate: Optional[str] = Field(default=None, description="Optional bitrate for lossy codecs.")
+    merge_backing_track: Optional[bool] = Field(
+        default=None,
+        description="Override whether to mix generated speech with the stored backing track (requires ClearVoice enhancement).",
+    )
 
 
 class CloneRequest(BaseModel):
@@ -2480,6 +2595,10 @@ async def home():
                                         <input type="checkbox" id="translateSuperResolution">
                                         <span>Super Resolution with MossFormer2_SR_48K</span>
                                     </label>
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateMergeBack" disabled>
+                                        <span>Mix translated speech back into instrumental (requires enhancement)</span>
+                                    </label>
                                 </div>
                                 <small style="color: #666; margin-top: 5px; display: block;">
                                     Defaults to off. Requires the ClearVoice package to be installed.
@@ -2516,6 +2635,7 @@ async def home():
                         </form>
                         <div id="translateStatus" class="status"></div>
                         <div id="translateAdvancedPanel" class="segment-panel" style="display: none;">
+                            <div id="translateBackingPreview" style="display: none; margin-bottom: 16px;"></div>
                             <div class="segment-controls">
                                 <label class="segment-checkbox">
                                     <input type="checkbox" id="translateSegmentsSelectAll" checked>
@@ -2607,7 +2727,7 @@ async def home():
                             <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
-                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>)</li>
+                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement)</li>
                                     <li>Audio will be automatically trimmed to 3-15 seconds at silence points; when both toggles are enabled, enhancement runs before super-resolution</li>
                                 </ul>
                             </li>
@@ -2622,7 +2742,7 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool) and <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing.</li>
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, and <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing.</li>
                                     <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false}</code></li>
                                     <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
@@ -3130,6 +3250,10 @@ async def home():
             const translateCustomPrompt = document.getElementById('translateCustomPrompt');
             const translateGeminiModel = document.getElementById('translateGeminiModel');
             const translateGeminiApiKey = document.getElementById('translateGeminiApiKey');
+            const translateEnhanceEl = document.getElementById('translateEnhancement');
+            const translateSuperEl = document.getElementById('translateSuperResolution');
+            const translateMergeBackEl = document.getElementById('translateMergeBack');
+            const translateBackingPreview = document.getElementById('translateBackingPreview');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
 
@@ -3153,6 +3277,22 @@ async def home():
                 }
             }
 
+            function syncTranslateMergeBackState() {
+                if (!translateMergeBackEl) {
+                    return;
+                }
+                const enhancementEnabled = translateEnhanceEl && translateEnhanceEl.checked;
+                translateMergeBackEl.disabled = !enhancementEnabled;
+                if (!enhancementEnabled) {
+                    translateMergeBackEl.checked = false;
+                }
+            }
+
+            if (translateEnhanceEl) {
+                translateEnhanceEl.addEventListener('change', syncTranslateMergeBackState);
+                syncTranslateMergeBackState();
+            }
+
             function resetAdvancedPanel(clearSession = true) {
                 if (clearSession) {
                     currentTranslateSessionId = null;
@@ -3163,6 +3303,10 @@ async def home():
                 }
                 if (translateSegmentsList) {
                     translateSegmentsList.innerHTML = '';
+                }
+                if (translateBackingPreview) {
+                    translateBackingPreview.style.display = 'none';
+                    translateBackingPreview.innerHTML = '';
                 }
                 if (translateSegmentsStatus) {
                     hideStatus('translateSegmentsStatus');
@@ -3324,6 +3468,31 @@ async def home():
                 updateTranslateSegmentsSummary();
             }
 
+            function renderBackingPreview(sessionId, metadata) {
+                if (!translateBackingPreview) {
+                    return;
+                }
+                const backingMeta = metadata && metadata.backing_track;
+                if (!backingMeta || !backingMeta.available) {
+                    translateBackingPreview.style.display = 'none';
+                    translateBackingPreview.innerHTML = '';
+                    return;
+                }
+                const previewUrl = (backingMeta.preview_url && backingMeta.preview_url.trim())
+                    ? backingMeta.preview_url
+                    : `/api/translate_backing_track/${sessionId}`;
+                const cacheKey = Date.now();
+                translateBackingPreview.innerHTML = `
+                    <div class="segment-card">
+                        <div class="segment-header">🎼 Instrumental Backing Preview</div>
+                        <audio controls style="width: 100%; margin-top: 6px;">
+                            <source src="${previewUrl}?session=${sessionId}&t=${cacheKey}" type="audio/wav">
+                        </audio>
+                    </div>
+                `;
+                translateBackingPreview.style.display = 'block';
+            }
+
             if (translateAdvancedToggle) {
                 translateAdvancedToggle.addEventListener('change', () => {
                     if (translateAdvancedSettings) {
@@ -3377,9 +3546,6 @@ async def home():
 
                     const selectedFormat = (formatSelect.value || 'mp3').toLowerCase();
 
-                    const translateEnhanceEl = document.getElementById('translateEnhancement');
-                    const translateSuperEl = document.getElementById('translateSuperResolution');
-
                     const advancedEnabled = translateAdvancedToggle && translateAdvancedToggle.checked;
 
                     if (advancedEnabled) {
@@ -3390,6 +3556,7 @@ async def home():
                         formData.append('response_format', selectedFormat);
                         formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                         formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                        formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         if (translateGeminiModel && translateGeminiModel.value) {
                             formData.append('gemini_model', translateGeminiModel.value);
                         }
@@ -3447,6 +3614,7 @@ async def home():
                             if (data.metadata && data.metadata.gemini_model && translateGeminiModel) {
                                 translateGeminiModel.value = data.metadata.gemini_model;
                             }
+                            renderBackingPreview(currentTranslateSessionId, data.metadata || null);
                             const translateEnabledNow = translateDebugTranslate ? translateDebugTranslate.checked : true;
                             currentTranslateSegments = Array.isArray(data.segments)
                                 ? data.segments.map(seg => ({
@@ -3490,6 +3658,7 @@ async def home():
                     formData.append('response_format', selectedFormat);
                     formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                     formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                    formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     if (translateGeminiModel && translateGeminiModel.value) {
                         formData.append('gemini_model', translateGeminiModel.value);
                     }
@@ -3643,6 +3812,7 @@ async def home():
                         session_id: currentTranslateSessionId,
                         segments: segmentsPayload,
                         response_format: selectedFormat,
+                        merge_backing_track: translateMergeBackEl && translateMergeBackEl.checked ? true : false,
                     };
 
                     try {
@@ -4202,6 +4372,7 @@ async def api_translate_segments(
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
+    merge_backing_track: Optional[bool] = Form(False),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
@@ -4218,6 +4389,10 @@ async def api_translate_segments(
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
+        merge_backing_track_value = merge_backing_track
+        merge_backing_track_value = merge_backing_track
+        merge_backing_track_value = merge_backing_track
+        merge_backing_track_value = merge_backing_track
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -4246,6 +4421,7 @@ async def api_translate_segments(
             gemini_api_key_value = payload.get("gemini_api_key", gemini_api_key_value)
             enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
             super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
+            merge_backing_track_value = payload.get("merge_backing_track", merge_backing_track_value)
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -4269,6 +4445,10 @@ async def api_translate_segments(
         translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        requested_merge_backing = _coerce_to_bool(merge_backing_track_value)
+        if requested_merge_backing and not apply_enhancement:
+            print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
+            requested_merge_backing = False
         allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
         gemini_model_value = (gemini_model_value or "").strip()
         if gemini_model_value and gemini_model_value not in allowed_gemini_models:
@@ -4305,6 +4485,12 @@ async def api_translate_segments(
                 content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
             )
 
+        backing_track_audio: Optional[AudioSegment] = None
+        pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
+
+        backing_track_audio: Optional[AudioSegment] = None
+        pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
+
         processed_paths: Set[str] = set()
         if apply_enhancement or apply_super_resolution:
             if ClearVoice is None:
@@ -4324,7 +4510,7 @@ async def api_translate_segments(
                     temp_input_path = tmp_input.name
                 processed_paths.add(temp_input_path)
 
-                final_processed_path, clearvoice_paths = await apply_clearvoice_processing(
+                final_processed_path, clearvoice_paths, enhancement_output_path = await apply_clearvoice_processing(
                     temp_input_path,
                     apply_enhancement,
                     apply_super_resolution,
@@ -4332,7 +4518,21 @@ async def api_translate_segments(
                 processed_paths.update(clearvoice_paths)
                 processed_paths.add(final_processed_path)
 
+                enhancement_audio = None
+                if apply_enhancement:
+                    enhancement_source = enhancement_output_path or final_processed_path
+                    try:
+                        enhancement_audio = AudioSegment.from_file(enhancement_source, format="wav")
+                    except Exception as enhancement_load_error:
+                        print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
                 original_audio = AudioSegment.from_file(final_processed_path, format="wav")
+                if apply_enhancement and pre_clearvoice_mix_audio is not None:
+                    backing_track_audio = _extract_backing_track_from_vocals(
+                        pre_clearvoice_mix_audio,
+                        enhancement_audio or original_audio,
+                    )
+                    if backing_track_audio is not None:
+                        print("🎶 Extracted instrumental backing track via MossFormer2_SE_48K.")
             except Exception as cv_error:
                 for path in processed_paths:
                     try:
@@ -4354,6 +4554,9 @@ async def api_translate_segments(
             original_audio.export(processed_buffer, format="wav")
             processed_audio_bytes = processed_buffer.getvalue()
         gemini_mime_type = "audio/wav"
+        merge_with_backing = requested_merge_backing and backing_track_audio is not None
+        if requested_merge_backing and backing_track_audio is None:
+            print("⚠️ Unable to merge with backing track because no instrumental was derived.")
 
         final_prompt = (prompt_override or "").strip()
         if not final_prompt:
@@ -4397,6 +4600,8 @@ async def api_translate_segments(
             gemini_chunks,
             resolved_gemini_model,
             gemini_api_key_value or None,
+            backing_track_audio=backing_track_audio,
+            merge_with_backing=merge_with_backing,
         )
         ui_segments = _serialize_segments_for_ui(segments, original_audio)
 
@@ -4414,6 +4619,12 @@ async def api_translate_segments(
             "clearvoice": {
                 "enhancement": apply_enhancement,
                 "super_resolution": apply_super_resolution,
+            },
+            "backing_track": {
+                "available": backing_track_audio is not None,
+                "requested": requested_merge_backing,
+                "merge_with_backing": merge_with_backing,
+                "preview_url": f"/api/translate_backing_track/{session.session_id}" if backing_track_audio is not None else None,
             },
         }
 
@@ -4448,6 +4659,14 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                 status_code=404,
                 content={"status": "error", "message": "Translate session not found or expired."},
             )
+
+        merge_preference = session.merge_with_backing
+        if payload.merge_backing_track is not None:
+            merge_preference = _coerce_to_bool(payload.merge_backing_track)
+            session.merge_with_backing = merge_preference
+        merge_with_backing = merge_preference and (session.backing_track_audio is not None)
+        if merge_preference and session.backing_track_audio is None:
+            print("⚠️ Merge-back preference is enabled but no backing track is stored for this session.")
 
         allowed_formats = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
         response_format_value = (
@@ -4538,8 +4757,11 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
             bitrate=bitrate_value,
             input_mime_type=session.input_mime_type,
             clearvoice_settings=session.clearvoice_settings,
+            backing_track_audio=session.backing_track_audio,
+            merge_with_backing=merge_with_backing,
         )
 
+        metadata.setdefault("backing_track", {})["requested"] = session.merge_with_backing
         generated_count = sum(
             1 for seg in final_segments if seg.get("type") == "speech" and not seg.get("keep_original", False)
         )
@@ -4575,6 +4797,9 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                 f"enhancement={str(clearvoice_settings.get('enhancement', False)).lower()};"
                 f"super_resolution={str(clearvoice_settings.get('super_resolution', False)).lower()}"
             )
+        headers["X-Translation-Backing"] = (
+            f"available={str(bool(session.backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
+        )
 
         return Response(content=audio_payload, media_type=media_type, headers=headers)
     except RuntimeError as runtime_error:
@@ -4590,6 +4815,38 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
         )
 
 
+@app.get("/api/translate_backing_track/{session_id}")
+async def api_translate_backing_track(session_id: str):
+    """API: Stream the stored instrumental backing track for an advanced translate session."""
+    session = await _get_translate_session(session_id)
+    if session is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Translate session not found or expired."},
+        )
+    if session.backing_track_audio is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "No backing track is available for this session."},
+        )
+
+    try:
+        buffer = BytesIO()
+        session.backing_track_audio.export(buffer, format="wav")
+        audio_bytes = buffer.getvalue()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to export backing track: {str(exc)}"},
+        )
+
+    headers = {
+        "Content-Disposition": f'inline; filename="translate_backing_{session_id}.wav"',
+        "Cache-Control": "no-store, no-cache",
+    }
+    return Response(content=audio_bytes, media_type="audio/wav", headers=headers)
+
+
 @app.post("/api/translate_audio")
 async def api_translate_audio(
     request: Request,
@@ -4603,6 +4860,7 @@ async def api_translate_audio(
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
+    merge_backing_track: Optional[bool] = Form(False),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
@@ -4618,6 +4876,7 @@ async def api_translate_audio(
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
+        merge_backing_track_value = merge_backing_track
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -4654,6 +4913,9 @@ async def api_translate_audio(
             super_resolution_voice_value = (
                 translate_req.super_resolution_voice if translate_req.super_resolution_voice is not None else super_resolution_voice_value
             )
+            merge_backing_track_value = (
+                translate_req.merge_backing_track if translate_req.merge_backing_track is not None else merge_backing_track_value
+            )
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -4676,6 +4938,10 @@ async def api_translate_audio(
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        requested_merge_backing = _coerce_to_bool(merge_backing_track_value)
+        if requested_merge_backing and not apply_enhancement:
+            print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
+            requested_merge_backing = False
         allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
         gemini_model_value = (gemini_model_value or "").strip()
         if gemini_model_value and gemini_model_value not in allowed_gemini_models:
@@ -4712,6 +4978,9 @@ async def api_translate_audio(
                 content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
             )
 
+        backing_track_audio: Optional[AudioSegment] = None
+        pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
+
         processed_paths: Set[str] = set()
         if apply_enhancement or apply_super_resolution:
             if ClearVoice is None:
@@ -4731,7 +5000,7 @@ async def api_translate_audio(
                     temp_input_path = tmp_input.name
                 processed_paths.add(temp_input_path)
 
-                final_processed_path, clearvoice_paths = await apply_clearvoice_processing(
+                final_processed_path, clearvoice_paths, enhancement_output_path = await apply_clearvoice_processing(
                     temp_input_path,
                     apply_enhancement,
                     apply_super_resolution,
@@ -4740,6 +5009,20 @@ async def api_translate_audio(
                 processed_paths.add(final_processed_path)
 
                 original_audio = AudioSegment.from_file(final_processed_path, format="wav")
+                enhancement_audio = None
+                if apply_enhancement:
+                    enhancement_source = enhancement_output_path or final_processed_path
+                    try:
+                        enhancement_audio = AudioSegment.from_file(enhancement_source, format="wav")
+                    except Exception as enhancement_load_error:
+                        print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
+                if apply_enhancement and pre_clearvoice_mix_audio is not None:
+                    backing_track_audio = _extract_backing_track_from_vocals(
+                        pre_clearvoice_mix_audio,
+                        enhancement_audio or original_audio,
+                    )
+                    if backing_track_audio is not None:
+                        print("🎶 Extracted instrumental backing track via MossFormer2_SE_48K (direct translate).")
             except Exception as cv_error:
                 for path in processed_paths:
                     try:
@@ -4761,6 +5044,9 @@ async def api_translate_audio(
             original_audio.export(processed_buffer, format="wav")
             processed_audio_bytes = processed_buffer.getvalue()
         gemini_mime_type = "audio/wav"
+        merge_with_backing = requested_merge_backing and backing_track_audio is not None
+        if requested_merge_backing and backing_track_audio is None:
+            print("⚠️ Unable to merge with backing track because no instrumental was derived.")
 
         final_prompt = (prompt_override or "").strip()
         if not final_prompt:
@@ -4787,8 +5073,17 @@ async def api_translate_audio(
                 "enhancement": apply_enhancement,
                 "super_resolution": apply_super_resolution,
             },
+            backing_track_audio=backing_track_audio,
+            merge_with_backing=merge_with_backing,
         )
 
+        metadata.setdefault("backing_track", {}).update(
+            {
+                "requested": requested_merge_backing,
+                "available": backing_track_audio is not None,
+                "merged": merge_with_backing,
+            }
+        )
         metadata["gemini_model"] = resolved_gemini_model
 
         headers = {
@@ -4800,6 +5095,9 @@ async def api_translate_audio(
             "X-Translation-Input-Mime": input_mime_type or "",
             "X-Translation-ClearVoice": f"enhancement={str(apply_enhancement).lower()};super_resolution={str(apply_super_resolution).lower()}",
         }
+        headers["X-Translation-Backing"] = (
+            f"available={str(bool(backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
+        )
 
         print(
             f"✅ Translation complete: {metadata.get('segment_count', len(segments))} segments "
