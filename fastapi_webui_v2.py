@@ -114,7 +114,7 @@ TRANSLATE_DEFAULT_BITRATE = "192k"
 AUDIO_GENERATION_MARGIN_MS = 20
 TRANSLATION_TTS_CONCURRENCY = 20
 MIN_SPEECH_DURATION_MS = 3000
-MAX_MERGE_INTERVAL_MS = 500
+MAX_MERGE_INTERVAL_MS = 300
 
 
 @dataclass
@@ -862,7 +862,62 @@ def _coerce_to_bool(value: Any) -> bool:
     return bool(value)
 
 
-def _merge_short_speech_segments(segments: List[Dict[str, Any]], min_duration_ms: int) -> List[Dict[str, Any]]:
+def _coerce_positive_int(
+    value: Any,
+    default: int,
+    *,
+    min_value: int = 0,
+    max_value: Optional[int] = None,
+) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < min_value:
+        return min_value
+    if max_value is not None and parsed > max_value:
+        return max_value
+    return parsed
+
+
+def _parse_manual_segments_input(raw: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Parse user-supplied Gemini segment JSON.
+    Accepts either a JSON array or an object with a top-level "segments" array.
+    """
+    if raw is None:
+        return None
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return None
+    try:
+        parsed = json.loads(raw_str)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"segments_json is not valid JSON: {exc}") from exc
+
+    if isinstance(parsed, dict) and "segments" in parsed:
+        parsed = parsed["segments"]
+
+    if not isinstance(parsed, list):
+        raise ValueError("segments_json must be a JSON array of segment objects.")
+    if not parsed:
+        raise ValueError("segments_json array is empty.")
+
+    cleaned: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(parsed):
+        if not isinstance(entry, dict):
+            raise ValueError(f"segments_json[{idx}] is not an object.")
+        cleaned.append(entry)
+    return cleaned
+
+
+def _merge_short_speech_segments(
+    segments: List[Dict[str, Any]],
+    min_duration_ms: int,
+    max_merge_interval_ms: int = MAX_MERGE_INTERVAL_MS,
+) -> List[Dict[str, Any]]:
     merged_segments: List[Dict[str, Any]] = []
     i = 0
     total = len(segments)
@@ -888,14 +943,14 @@ def _merge_short_speech_segments(segments: List[Dict[str, Any]], min_duration_ms
         j = i + 1
 
         # Merge forward with following silence/speech until threshold reached
-        # Only merge if silence intervals are short (<= MAX_MERGE_INTERVAL_MS)
+        # Only merge if silence intervals are short (<= max_merge_interval_ms)
         while end_ms - start_ms < min_duration_ms and j < total:
             next_segment = segments[j]
             seg_type = next_segment.get("type")
             if seg_type == "silence":
                 silence_duration = int(next_segment.get("duration_ms", 0))
                 # Only merge if silence is short enough
-                if silence_duration <= MAX_MERGE_INTERVAL_MS:
+                if silence_duration <= max_merge_interval_ms:
                     end_ms = int(next_segment.get("end_ms", end_ms))
                     j += 1
                     continue
@@ -926,7 +981,7 @@ def _merge_short_speech_segments(segments: List[Dict[str, Any]], min_duration_ms
                 prev_end_ms = int(prev_segment.get("end_ms", 0))
                 gap_ms = start_ms - prev_end_ms
                 # Only merge backward if gap is short enough
-                if gap_ms <= MAX_MERGE_INTERVAL_MS:
+                if gap_ms <= max_merge_interval_ms:
                     prev_segment["end_ms"] = end_ms
                     prev_segment["duration_ms"] = end_ms - int(prev_segment.get("start_ms", start_ms))
                     prev_segment["end"] = _format_ms_to_timestamp(end_ms)
@@ -1153,6 +1208,9 @@ def _prepare_translation_segments(
     original_audio: AudioSegment,
     chunk_data: List[Dict[str, Any]],
     dest_language: str,
+    *,
+    min_speech_duration_ms: int = MIN_SPEECH_DURATION_MS,
+    max_merge_interval_ms: int = MAX_MERGE_INTERVAL_MS,
 ) -> List[Dict[str, Any]]:
     total_duration_ms = len(original_audio)
     segments: List[Dict[str, Any]] = []
@@ -1290,7 +1348,11 @@ def _prepare_translation_segments(
             silence_payload["index"] = len(segments)
             segments.append(silence_payload)
 
-    segments = _merge_short_speech_segments(segments, MIN_SPEECH_DURATION_MS)
+    segments = _merge_short_speech_segments(
+        segments,
+        max(0, int(min_speech_duration_ms)),
+        max_merge_interval_ms=max(0, int(max_merge_interval_ms)),
+    )
 
     return segments
 
@@ -1903,6 +1965,18 @@ class TranslateRequest(BaseModel):
     merge_backing_track: Optional[bool] = Field(
         default=False,
         description="When enabled, mix the regenerated speech back onto an instrumental backing track extracted during ClearVoice enhancement.",
+    )
+    segments_json: Optional[str] = Field(
+        default=None,
+        description="Optional JSON array of pre-generated Gemini-like segments to skip inference.",
+    )
+    min_speech_ms: Optional[int] = Field(
+        default=None,
+        description="Override the minimum speech segment duration (ms) when merging short segments.",
+    )
+    max_merge_ms: Optional[int] = Field(
+        default=None,
+        description="Override the maximum silence gap (ms) allowed when merging neighboring segments.",
     )
     gemini_model: Optional[str] = Field(
         default=None,
@@ -2604,6 +2678,50 @@ async def home():
                                     Defaults to off. Requires the ClearVoice package to be installed.
                                 </small>
                             </div>
+                            <div class="form-group">
+                                <label>Segment Merge Settings (Optional):</label>
+                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                    <div style="flex: 1 1 220px;">
+                                        <label for="translateMinSpeech" style="font-weight: 500;">Minimum speech duration (ms):</label>
+                                        <input type="number" id="translateMinSpeech" min="500" step="100" placeholder="Default 3000">
+                                    </div>
+                                    <div style="flex: 1 1 220px;">
+                                        <label for="translateMaxMerge" style="font-weight: 500;">Max merge silence gap (ms):</label>
+                                        <input type="number" id="translateMaxMerge" min="50" step="50" placeholder="Default 300">
+                                    </div>
+                                </div>
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences.
+                                </small>
+                            </div>
+                            <div class="form-group">
+                                <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                                    <input type="checkbox" id="translateManualSegmentsToggle">
+                                    <span>Provide manual Gemini segments JSON (skip Gemini inference)</span>
+                                </label>
+                                <div id="translateManualSegmentsPanel" style="display: none;">
+                                    <textarea id="translateManualSegments" rows="6" placeholder='Paste the raw JSON array returned from Gemini (or another AI). Each entry should include "start", "end", "source_text", and "translated_text".'></textarea>
+                                    <small style="color: #666; display: block; margin-top: 6px;">
+                                        Use the prompt templates below with any LLM to generate the JSON response, then paste it here to bypass the Gemini API step.
+                                    </small>
+                                </div>
+                            </div>
+                            <div class="form-group" id="translatePromptTemplates" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px;">
+                                <label>Gemini Prompt Templates</label>
+                                <div style="display: flex; flex-wrap: wrap; gap: 16px;">
+                                    <div style="flex: 1 1 250px;">
+                                        <label style="font-weight: 500;">Translation mode prompt:</label>
+                                        <textarea id="translatePromptTranslation" readonly style="min-height: 140px;"></textarea>
+                                    </div>
+                                    <div style="flex: 1 1 250px;">
+                                        <label style="font-weight: 500;">Transcription-only prompt:</label>
+                                        <textarea id="translatePromptTranscription" readonly style="min-height: 140px;"></textarea>
+                                    </div>
+                                </div>
+                                <small style="color: #666; display: block; margin-top: 6px;">
+                                    Copy these prompts when generating manual segments with your preferred AI model. Replace <code>{'{dest_language}'}</code> as needed.
+                                </small>
+                            </div>
                             <div class="form-group" style="margin-top: 20px;">
                                 <label style="display: flex; align-items: center; gap: 10px;">
                                     <input type="checkbox" id="translateAdvancedMode">
@@ -2727,7 +2845,7 @@ async def home():
                             <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
-                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement)</li>
+                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement); <code>min_speech_ms</code>/<code>max_merge_ms</code> override the segment-merging heuristics; <code>segments_json</code> lets you supply Gemini-style JSON to skip inference.</li>
                                     <li>Audio will be automatically trimmed to 3-15 seconds at silence points; when both toggles are enabled, enhancement runs before super-resolution</li>
                                 </ul>
                             </li>
@@ -2742,8 +2860,8 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, and <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing.</li>
-                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false}</code></li>
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
+                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]","min_speech_ms": 3000, "max_merge_ms": 300}</code></li>
                                     <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
                             </li>
@@ -3250,12 +3368,25 @@ async def home():
             const translateCustomPrompt = document.getElementById('translateCustomPrompt');
             const translateGeminiModel = document.getElementById('translateGeminiModel');
             const translateGeminiApiKey = document.getElementById('translateGeminiApiKey');
+            const translateDestLanguageSelect = document.getElementById('translateDestLanguage');
             const translateEnhanceEl = document.getElementById('translateEnhancement');
             const translateSuperEl = document.getElementById('translateSuperResolution');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
             const translateBackingPreview = document.getElementById('translateBackingPreview');
+            const translateMinSpeechInput = document.getElementById('translateMinSpeech');
+            const translateMaxMergeInput = document.getElementById('translateMaxMerge');
+            const translateManualSegmentsToggle = document.getElementById('translateManualSegmentsToggle');
+            const translateManualSegmentsPanel = document.getElementById('translateManualSegmentsPanel');
+            const translateManualSegmentsInput = document.getElementById('translateManualSegments');
+            const translatePromptTranslation = document.getElementById('translatePromptTranslation');
+            const translatePromptTranscription = document.getElementById('translatePromptTranscription');
+            const translatePromptTemplates = document.getElementById('translatePromptTemplates');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
+            let promptTemplates = {
+                translation: '',
+                transcription: '',
+            };
 
             function formatTimestamp(ms) {
                 const totalMs = Math.max(0, Math.round(ms || 0));
@@ -3292,6 +3423,92 @@ async def home():
                 translateEnhanceEl.addEventListener('change', syncTranslateMergeBackState);
                 syncTranslateMergeBackState();
             }
+            if (translateDestLanguageSelect) {
+                translateDestLanguageSelect.addEventListener('change', refreshPromptTemplates);
+            }
+
+            function appendSegmentParameters(formData) {
+                if (!formData) {
+                    return;
+                }
+                if (translateMinSpeechInput) {
+                    const minValue = (translateMinSpeechInput.value || '').trim();
+                    if (minValue) {
+                        formData.append('min_speech_ms', minValue);
+                    }
+                }
+                if (translateMaxMergeInput) {
+                    const maxValue = (translateMaxMergeInput.value || '').trim();
+                    if (maxValue) {
+                        formData.append('max_merge_ms', maxValue);
+                    }
+                }
+            }
+
+            function appendManualSegments(formData) {
+                if (
+                    !formData ||
+                    !translateManualSegmentsToggle ||
+                    !translateManualSegmentsInput ||
+                    !translateManualSegmentsToggle.checked
+                ) {
+                    return;
+                }
+                const manualText = translateManualSegmentsInput.value.trim();
+                if (manualText) {
+                    formData.append('segments_json', manualText);
+                }
+            }
+
+            function refreshPromptTemplates() {
+                const destLang = translateDestLanguageSelect ? (translateDestLanguageSelect.value || '').trim() : '';
+                const replacement = destLang || '{dest_language}';
+                if (translatePromptTranslation) {
+                    translatePromptTranslation.value = promptTemplates.translation
+                        ? promptTemplates.translation.split('{dest_language}').join(replacement)
+                        : '';
+                }
+                if (translatePromptTranscription) {
+                    translatePromptTranscription.value = promptTemplates.transcription
+                        ? promptTemplates.transcription.split('{dest_language}').join(replacement)
+                        : '';
+                }
+            }
+            if (translateManualSegmentsToggle && translateManualSegmentsPanel) {
+                const updateManualSegmentsVisibility = () => {
+                    const enabled = translateManualSegmentsToggle.checked;
+                    translateManualSegmentsPanel.style.display = enabled ? 'block' : 'none';
+                    if (translatePromptTemplates) {
+                        translatePromptTemplates.style.display = enabled ? 'block' : 'none';
+                    }
+                };
+                translateManualSegmentsToggle.addEventListener('change', updateManualSegmentsVisibility);
+                updateManualSegmentsVisibility();
+            }
+
+            async function loadPromptTemplates() {
+                if (!translatePromptTranslation && !translatePromptTranscription) {
+                    return;
+                }
+                try {
+                    const response = await fetch('/api/prompt_templates');
+                    if (!response.ok) {
+                        return;
+                    }
+                    const data = await response.json();
+                    if (typeof data.translation === 'string') {
+                        promptTemplates.translation = data.translation;
+                    }
+                    if (typeof data.transcription === 'string') {
+                        promptTemplates.transcription = data.transcription;
+                    }
+                    refreshPromptTemplates();
+                } catch (error) {
+                    console.warn('Failed to load prompt templates', error);
+                }
+            }
+
+            loadPromptTemplates();
 
             function resetAdvancedPanel(clearSession = true) {
                 if (clearSession) {
@@ -3493,6 +3710,26 @@ async def home():
                 translateBackingPreview.style.display = 'block';
             }
 
+            function syncSegmentRulesFromMetadata(rules) {
+                if (!rules) {
+                    return;
+                }
+                if (translateMinSpeechInput) {
+                    if (rules.min_speech_ms !== undefined && rules.min_speech_ms !== null) {
+                        translateMinSpeechInput.value = rules.min_speech_ms;
+                    } else {
+                        translateMinSpeechInput.value = '';
+                    }
+                }
+                if (translateMaxMergeInput) {
+                    if (rules.max_merge_ms !== undefined && rules.max_merge_ms !== null) {
+                        translateMaxMergeInput.value = rules.max_merge_ms;
+                    } else {
+                        translateMaxMergeInput.value = '';
+                    }
+                }
+            }
+
             if (translateAdvancedToggle) {
                 translateAdvancedToggle.addEventListener('change', () => {
                     if (translateAdvancedSettings) {
@@ -3570,6 +3807,8 @@ async def home():
                         if (customPromptValue) {
                             formData.append('prompt', customPromptValue);
                         }
+                        appendSegmentParameters(formData);
+                        appendManualSegments(formData);
 
                         try {
                             if (translateBtn) {
@@ -3615,6 +3854,9 @@ async def home():
                                 translateGeminiModel.value = data.metadata.gemini_model;
                             }
                             renderBackingPreview(currentTranslateSessionId, data.metadata || null);
+                            if (data.metadata && data.metadata.segment_rules) {
+                                syncSegmentRulesFromMetadata(data.metadata.segment_rules);
+                            }
                             const translateEnabledNow = translateDebugTranslate ? translateDebugTranslate.checked : true;
                             currentTranslateSegments = Array.isArray(data.segments)
                                 ? data.segments.map(seg => ({
@@ -3665,6 +3907,8 @@ async def home():
                     if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                         formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
                     }
+                    appendSegmentParameters(formData);
+                    appendManualSegments(formData);
 
                     try {
                         if (translateBtn) {
@@ -4358,6 +4602,15 @@ async def api_clear_outputs():
         }
 
 
+@app.get("/api/prompt_templates")
+async def api_prompt_templates():
+    """Return the default Gemini prompt templates so users can run them elsewhere."""
+    return {
+        "translation": TRANSLATION_PROMPT_TEMPLATE,
+        "transcription": TRANSCRIPTION_PROMPT_TEMPLATE,
+    }
+
+
 @app.post("/api/translate_segments")
 async def api_translate_segments(
     request: Request,
@@ -4373,6 +4626,9 @@ async def api_translate_segments(
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
     merge_backing_track: Optional[bool] = Form(False),
+    min_speech_ms: Optional[int] = Form(None),
+    max_merge_ms: Optional[int] = Form(None),
+    segments_json: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
@@ -4390,6 +4646,17 @@ async def api_translate_segments(
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
         merge_backing_track_value = merge_backing_track
+        min_speech_duration_value = min_speech_ms
+        max_merge_interval_value = max_merge_ms
+        segments_override_value = segments_json
+        min_speech_duration_value = min_speech_ms
+        max_merge_interval_value = max_merge_ms
+        segments_override_value = segments_json
+        min_speech_duration_value = min_speech_ms
+        max_merge_interval_value = max_merge_ms
+        merge_backing_track_value = merge_backing_track
+        min_speech_duration_value = min_speech_ms
+        max_merge_interval_value = max_merge_ms
         merge_backing_track_value = merge_backing_track
         merge_backing_track_value = merge_backing_track
         merge_backing_track_value = merge_backing_track
@@ -4422,6 +4689,9 @@ async def api_translate_segments(
             enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
             super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
             merge_backing_track_value = payload.get("merge_backing_track", merge_backing_track_value)
+            min_speech_duration_value = payload.get("min_speech_ms", min_speech_duration_value)
+            max_merge_interval_value = payload.get("max_merge_ms", max_merge_interval_value)
+            segments_override_value = payload.get("segments_json", segments_override_value)
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -4449,6 +4719,16 @@ async def api_translate_segments(
         if requested_merge_backing and not apply_enhancement:
             print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
             requested_merge_backing = False
+        min_speech_duration = _coerce_positive_int(
+            min_speech_duration_value,
+            MIN_SPEECH_DURATION_MS,
+            min_value=500,
+        )
+        max_merge_interval = _coerce_positive_int(
+            max_merge_interval_value,
+            MAX_MERGE_INTERVAL_MS,
+            min_value=50,
+        )
         allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
         gemini_model_value = (gemini_model_value or "").strip()
         if gemini_model_value and gemini_model_value not in allowed_gemini_models:
@@ -4484,9 +4764,6 @@ async def api_translate_segments(
                 status_code=400,
                 content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
             )
-
-        backing_track_audio: Optional[AudioSegment] = None
-        pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
 
         backing_track_audio: Optional[AudioSegment] = None
         pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
@@ -4565,15 +4842,36 @@ async def api_translate_segments(
             else:
                 final_prompt = TRANSCRIPTION_PROMPT_TEMPLATE
 
-        gemini_chunks = await _gemini_transcribe_translate(
-            processed_audio_bytes,
-            gemini_mime_type,
+        manual_chunk_data = None
+        manual_segments_used = False
+        if segments_override_value:
+            try:
+                manual_chunk_data = _parse_manual_segments_input(segments_override_value)
+                manual_segments_used = True
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": str(exc)},
+                )
+
+        if manual_chunk_data is not None:
+            gemini_chunks = manual_chunk_data
+        else:
+            gemini_chunks = await _gemini_transcribe_translate(
+                processed_audio_bytes,
+                gemini_mime_type,
+                dest_language_value,
+                final_prompt,
+                model_name=resolved_gemini_model,
+                api_key_override=gemini_api_key_value or None,
+            )
+        segments = _prepare_translation_segments(
+            original_audio,
+            gemini_chunks,
             dest_language_value,
-            final_prompt,
-            model_name=resolved_gemini_model,
-            api_key_override=gemini_api_key_value or None,
+            min_speech_duration_ms=min_speech_duration,
+            max_merge_interval_ms=max_merge_interval,
         )
-        segments = _prepare_translation_segments(original_audio, gemini_chunks, dest_language_value)
 
         if not translate_enabled:
             for segment in segments:
@@ -4626,6 +4924,11 @@ async def api_translate_segments(
                 "merge_with_backing": merge_with_backing,
                 "preview_url": f"/api/translate_backing_track/{session.session_id}" if backing_track_audio is not None else None,
             },
+            "segment_rules": {
+                "min_speech_ms": min_speech_duration,
+                "max_merge_ms": max_merge_interval,
+            },
+            "manual_segments": manual_segments_used,
         }
 
         return JSONResponse(
@@ -4861,6 +5164,9 @@ async def api_translate_audio(
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
     merge_backing_track: Optional[bool] = Form(False),
+    min_speech_ms: Optional[int] = Form(None),
+    max_merge_ms: Optional[int] = Form(None),
+    segments_json: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
@@ -4916,6 +5222,21 @@ async def api_translate_audio(
             merge_backing_track_value = (
                 translate_req.merge_backing_track if translate_req.merge_backing_track is not None else merge_backing_track_value
             )
+            min_speech_duration_value = (
+                translate_req.min_speech_ms if translate_req.min_speech_ms is not None else min_speech_duration_value
+            )
+            max_merge_interval_value = (
+                translate_req.max_merge_ms if translate_req.max_merge_ms is not None else max_merge_interval_value
+            )
+            segments_override_value = (
+                translate_req.segments_json if translate_req.segments_json is not None else segments_override_value
+            )
+            min_speech_duration_value = (
+                translate_req.min_speech_ms if translate_req.min_speech_ms is not None else min_speech_duration_value
+            )
+            max_merge_interval_value = (
+                translate_req.max_merge_ms if translate_req.max_merge_ms is not None else max_merge_interval_value
+            )
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -4942,6 +5263,26 @@ async def api_translate_audio(
         if requested_merge_backing and not apply_enhancement:
             print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
             requested_merge_backing = False
+        min_speech_duration = _coerce_positive_int(
+            min_speech_duration_value,
+            MIN_SPEECH_DURATION_MS,
+            min_value=500,
+        )
+        max_merge_interval = _coerce_positive_int(
+            max_merge_interval_value,
+            MAX_MERGE_INTERVAL_MS,
+            min_value=50,
+        )
+        min_speech_duration = _coerce_positive_int(
+            min_speech_duration_value,
+            MIN_SPEECH_DURATION_MS,
+            min_value=500,
+        )
+        max_merge_interval = _coerce_positive_int(
+            max_merge_interval_value,
+            MAX_MERGE_INTERVAL_MS,
+            min_value=50,
+        )
         allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
         gemini_model_value = (gemini_model_value or "").strip()
         if gemini_model_value and gemini_model_value not in allowed_gemini_models:
@@ -5052,15 +5393,35 @@ async def api_translate_audio(
         if not final_prompt:
             final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
 
-        gemini_chunks = await _gemini_transcribe_translate(
-            processed_audio_bytes,
-            gemini_mime_type,
+        manual_chunk_data = None
+        manual_segments_used = False
+        if segments_override_value:
+            try:
+                manual_chunk_data = _parse_manual_segments_input(segments_override_value)
+                manual_segments_used = True
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": str(exc)},
+                )
+        if manual_chunk_data is not None:
+            gemini_chunks = manual_chunk_data
+        else:
+            gemini_chunks = await _gemini_transcribe_translate(
+                processed_audio_bytes,
+                gemini_mime_type,
+                dest_language_value,
+                final_prompt,
+                model_name=resolved_gemini_model,
+                api_key_override=gemini_api_key_value or None,
+            )
+        segments = _prepare_translation_segments(
+            original_audio,
+            gemini_chunks,
             dest_language_value,
-            final_prompt,
-            model_name=resolved_gemini_model,
-            api_key_override=gemini_api_key_value or None,
+            min_speech_duration_ms=min_speech_duration,
+            max_merge_interval_ms=max_merge_interval,
         )
-        segments = _prepare_translation_segments(original_audio, gemini_chunks, dest_language_value)
 
         audio_payload, media_type, metadata = await _synthesize_translated_audio(
             original_audio,
@@ -5084,6 +5445,15 @@ async def api_translate_audio(
                 "merged": merge_with_backing,
             }
         )
+        metadata["segment_rules"] = {
+            "min_speech_ms": min_speech_duration,
+            "max_merge_ms": max_merge_interval,
+        }
+        metadata["manual_segments"] = manual_segments_used
+        metadata["segment_rules"] = {
+            "min_speech_ms": min_speech_duration,
+            "max_merge_ms": max_merge_interval,
+        }
         metadata["gemini_model"] = resolved_gemini_model
 
         headers = {
