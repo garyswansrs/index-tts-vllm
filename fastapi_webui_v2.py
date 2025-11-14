@@ -5183,6 +5183,9 @@ async def api_translate_audio(
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
         merge_backing_track_value = merge_backing_track
+        min_speech_duration_value = min_speech_ms
+        max_merge_interval_value = max_merge_ms
+        segments_override_value = segments_json
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -5263,16 +5266,6 @@ async def api_translate_audio(
         if requested_merge_backing and not apply_enhancement:
             print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
             requested_merge_backing = False
-        min_speech_duration = _coerce_positive_int(
-            min_speech_duration_value,
-            MIN_SPEECH_DURATION_MS,
-            min_value=500,
-        )
-        max_merge_interval = _coerce_positive_int(
-            max_merge_interval_value,
-            MAX_MERGE_INTERVAL_MS,
-            min_value=50,
-        )
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
             MIN_SPEECH_DURATION_MS,
