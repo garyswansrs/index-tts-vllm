@@ -58,7 +58,7 @@ except ImportError:
 
 # FastAPI and web interface
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 # IndexTTS v2 and speaker management
@@ -88,6 +88,7 @@ JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 TRANSLATION_PROMPT_TEMPLATE = (
     "You are a professional interpreter. "
     "Transcribe the speech from the provided audio and translate it into {dest_language} using natural, conversational wording. "
+    "{non_speech_instruction}"
     "Return a JSON array where each item contains exactly the keys: "
     "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
     "\"end\" (same format), "
@@ -99,6 +100,7 @@ TRANSLATION_PROMPT_TEMPLATE = (
 TRANSCRIPTION_PROMPT_TEMPLATE = (
     "You are a meticulous transcription expert. "
     "Transcribe the provided speech audio in its original language without translating it. "
+    "{non_speech_instruction}"
     "Return a JSON array where each item contains the keys: "
     "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
     "\"end\" (same format), "
@@ -107,6 +109,10 @@ TRANSCRIPTION_PROMPT_TEMPLATE = (
     "Ensure timestamps align with the audio and segments remain coherent. "
     "Respond with JSON only—no markdown or commentary."
 )
+IGNORE_NON_SPEECH_PROMPT_SUFFIX = (
+    "Ignore non-speech vocalizations (laughter, shouts, chants, or crowd noise) and any background voices that are not clear speech; only capture spoken dialogue."
+)
+NON_SPEECH_PROMPT_PLACEHOLDER = "{non_speech_instruction}"
 DEFAULT_GEMINI_TEMPERATURE = 0.2
 DEFAULT_GEMINI_TOP_P = 0.9
 TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
@@ -134,12 +140,21 @@ class TranslateSessionData:
     gemini_api_key: Optional[str]
     backing_track_audio: Optional[AudioSegment] = None
     merge_with_backing: bool = False
+    ignore_non_speech: bool = False
+    preserve_silence_audio: bool = False
     created_at: float = field(default_factory=lambda: time.time())
 
 
 ADVANCED_TRANSLATE_SESSIONS: Dict[str, TranslateSessionData] = {}
 ADVANCED_TRANSLATE_SESSION_LOCK = asyncio.Lock()
 ADVANCED_TRANSLATE_SESSION_TTL_SECONDS = 60 * 60  # 1 hour
+
+
+class TranslateWorkflowHttpError(Exception):
+    def __init__(self, status_code: int, content: Dict[str, Any]):
+        super().__init__(content.get("message") or "Translate workflow error")
+        self.status_code = status_code
+        self.content = content
 
 
 @functools.lru_cache(maxsize=4)
@@ -240,6 +255,22 @@ os.makedirs("outputs/tasks", exist_ok=True)
 os.makedirs("outputs", exist_ok=True)
 os.makedirs("prompts", exist_ok=True)
 os.makedirs("speaker_presets", exist_ok=True)
+TRANSLATE_OUTPUT_DIR = os.path.join("outputs", "translate_results")
+os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
+
+
+def _guess_media_type_from_extension(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    mapping = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "flac": "audio/flac",
+        "aac": "audio/aac",
+        "opus": "audio/opus",
+        "ogg": "audio/ogg",
+        "webm": "audio/webm",
+    }
+    return mapping.get(ext, "application/octet-stream")
 
 # Async wrapper functions for blocking operations
 async def async_write_file(file_path: str, data: bytes) -> None:
@@ -1039,7 +1070,8 @@ def _segment_audio_data_uri(
     audio: AudioSegment,
     start_ms: int,
     end_ms: int,
-    fmt: str = "wav",
+    fmt: str = "mp3",
+    bitrate: str = "128k",
 ) -> Optional[str]:
     start = max(0, int(start_ms))
     end = max(start, int(end_ms))
@@ -1052,9 +1084,15 @@ def _segment_audio_data_uri(
     if len(snippet) == 0:
         return None
     buffer = BytesIO()
-    snippet.export(buffer, format=fmt)
+    export_kwargs: Dict[str, Any] = {}
+    if fmt == "mp3":
+        export_kwargs["bitrate"] = bitrate
+        mime_type = "audio/mpeg"
+    else:
+        mime_type = f"audio/{fmt}"
+    snippet.export(buffer, format=fmt, **export_kwargs)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:audio/{fmt};base64,{encoded}"
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def _serialize_segments_for_ui(
@@ -1117,6 +1155,8 @@ async def _create_translate_session(
     gemini_api_key: Optional[str],
     backing_track_audio: Optional[AudioSegment] = None,
     merge_with_backing: bool = False,
+    ignore_non_speech: bool = False,
+    preserve_silence_audio: bool = False,
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
     session = TranslateSessionData(
@@ -1135,6 +1175,8 @@ async def _create_translate_session(
         gemini_api_key=gemini_api_key,
         backing_track_audio=backing_track_audio,
         merge_with_backing=merge_with_backing,
+        ignore_non_speech=ignore_non_speech,
+        preserve_silence_audio=preserve_silence_audio,
     )
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         _cleanup_expired_translate_sessions_locked()
@@ -1401,6 +1443,7 @@ async def _synthesize_translated_audio(
     clearvoice_settings: Optional[Dict[str, bool]] = None,
     backing_track_audio: Optional[AudioSegment] = None,
     merge_with_backing: bool = False,
+    preserve_silence_audio: bool = False,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -1418,14 +1461,26 @@ async def _synthesize_translated_audio(
         duration_ms = max(0, int(segment.get("duration_ms", max(0, end_ms - start_ms))))
 
         if seg_type == "silence":
-            audio_seg = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
-            log_entry = {
-                "index": index,
-                "type": "silence",
-                "duration_ms": duration_ms,
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-            }
+            if preserve_silence_audio:
+                chunk_audio = original_audio[start_ms:end_ms]
+                audio_seg = _match_segment_duration(chunk_audio, duration_ms, frame_rate, sample_width, channels)
+                log_entry = {
+                    "index": index,
+                    "type": "silence",
+                    "status": "preserved",
+                    "duration_ms": duration_ms,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
+            else:
+                audio_seg = _create_silence_segment(duration_ms, frame_rate, sample_width, channels)
+                log_entry = {
+                    "index": index,
+                    "type": "silence",
+                    "duration_ms": duration_ms,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
             return index, audio_seg, log_entry
 
         translated_text = (segment.get("translated_text") or "").strip()
@@ -1582,6 +1637,7 @@ async def _synthesize_translated_audio(
         "available": backing_track_audio is not None,
         "merged": backing_applied,
     }
+    metadata["preserve_silence_audio"] = preserve_silence_audio
 
     return audio_bytes, media_type, metadata
 
@@ -1647,7 +1703,24 @@ async def _gemini_transcribe_translate(
         return text
 
     loop = asyncio.get_event_loop()
-    raw_text = await loop.run_in_executor(executor, _call_gemini)
+    max_attempts = 10
+    retry_delay_seconds = 10
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw_text = await loop.run_in_executor(executor, _call_gemini)
+            break
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"⚠️ Gemini call failed (attempt {attempt}/{max_attempts}): {exc}. "
+                f"Retrying in {retry_delay_seconds}s..."
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay_seconds)
+    else:
+        raise RuntimeError(f"Gemini request failed after {max_attempts} attempts: {last_error}")
+
     return _parse_gemini_json(raw_text)
 
 # Global TTS manager
@@ -1985,6 +2058,14 @@ class TranslateRequest(BaseModel):
     gemini_api_key: Optional[str] = Field(
         default=None,
         description="Provide a Gemini API key for this request if environment key is not set.",
+    )
+    ignore_non_speech: Optional[bool] = Field(
+        default=False,
+        description="When true, ask Gemini to ignore non-speech vocalizations and background voices.",
+    )
+    preserve_silence_audio: Optional[bool] = Field(
+        default=False,
+        description="When true, reuse the original audio for any segments labeled as silence.",
     )
 
 
@@ -2695,6 +2776,24 @@ async def home():
                                 </small>
                             </div>
                             <div class="form-group">
+                                <label style="display: flex; align-items: center; gap: 10px;">
+                                    <input type="checkbox" id="translateIgnoreNonSpeech">
+                                    <span>Ask Gemini to ignore non-speech (laughs, shouts, crowd noise)</span>
+                                </label>
+                                <small style="color: #666; margin-top: 6px; display: block;">
+                                    When enabled, Gemini only transcribes spoken dialogue and skips non-speech vocalizations.
+                                </small>
+                            </div>
+                            <div class="form-group">
+                                <label style="display: flex; align-items: center; gap: 10px;">
+                                    <input type="checkbox" id="translatePreserveSilence">
+                                    <span>Preserve original audio for segments treated as silence</span>
+                                </label>
+                                <small style="color: #666; margin-top: 6px; display: block;">
+                                    Keeps the source vocal audio for silent segments (helpful for laughs or crowd reactions).
+                                </small>
+                            </div>
+                            <div class="form-group">
                                 <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
                                     <input type="checkbox" id="translateManualSegmentsToggle">
                                     <span>Provide manual Gemini segments JSON (skip Gemini inference)</span>
@@ -3372,6 +3471,8 @@ async def home():
             const translateEnhanceEl = document.getElementById('translateEnhancement');
             const translateSuperEl = document.getElementById('translateSuperResolution');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
+            const translateIgnoreNonSpeechEl = document.getElementById('translateIgnoreNonSpeech');
+            const translatePreserveSilenceEl = document.getElementById('translatePreserveSilence');
             const translateBackingPreview = document.getElementById('translateBackingPreview');
             const translateMinSpeechInput = document.getElementById('translateMinSpeech');
             const translateMaxMergeInput = document.getElementById('translateMaxMerge');
@@ -3386,7 +3487,9 @@ async def home():
             let promptTemplates = {
                 translation: '',
                 transcription: '',
+                ignoreNonSpeech: '',
             };
+            const NON_SPEECH_PLACEHOLDER = '{non_speech_instruction}';
 
             function formatTimestamp(ms) {
                 const totalMs = Math.max(0, Math.round(ms || 0));
@@ -3426,6 +3529,25 @@ async def home():
             if (translateDestLanguageSelect) {
                 translateDestLanguageSelect.addEventListener('change', refreshPromptTemplates);
             }
+            function syncPreserveSilenceState() {
+                if (!translatePreserveSilenceEl) {
+                    return;
+                }
+                const ignoreEnabled = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked;
+                translatePreserveSilenceEl.disabled = !ignoreEnabled;
+                if (!ignoreEnabled) {
+                    translatePreserveSilenceEl.checked = false;
+                }
+            }
+            if (translateIgnoreNonSpeechEl) {
+                translateIgnoreNonSpeechEl.addEventListener('change', () => {
+                    refreshPromptTemplates();
+                    syncPreserveSilenceState();
+                });
+                syncPreserveSilenceState();
+            } else {
+                syncPreserveSilenceState();
+            }
 
             function appendSegmentParameters(formData) {
                 if (!formData) {
@@ -3463,15 +3585,30 @@ async def home():
             function refreshPromptTemplates() {
                 const destLang = translateDestLanguageSelect ? (translateDestLanguageSelect.value || '').trim() : '';
                 const replacement = destLang || '{dest_language}';
-                if (translatePromptTranslation) {
-                    translatePromptTranslation.value = promptTemplates.translation
-                        ? promptTemplates.translation.split('{dest_language}').join(replacement)
+                const instructionSegment =
+                    translateIgnoreNonSpeechEl &&
+                    translateIgnoreNonSpeechEl.checked &&
+                    typeof promptTemplates.ignoreNonSpeech === 'string' &&
+                    promptTemplates.ignoreNonSpeech.trim().length > 0
+                        ? `${promptTemplates.ignoreNonSpeech.trim()} `
                         : '';
+                if (translatePromptTranslation) {
+                    const value = promptTemplates.translation
+                        ? promptTemplates.translation
+                              .split('{dest_language}')
+                              .join(replacement)
+                              .split(NON_SPEECH_PLACEHOLDER)
+                              .join(instructionSegment)
+                        : '';
+                    translatePromptTranslation.value = value.trim();
                 }
                 if (translatePromptTranscription) {
-                    translatePromptTranscription.value = promptTemplates.transcription
-                        ? promptTemplates.transcription.split('{dest_language}').join(replacement)
+                    const value = promptTemplates.transcription
+                        ? promptTemplates.transcription
+                              .split(NON_SPEECH_PLACEHOLDER)
+                              .join(instructionSegment)
                         : '';
+                    translatePromptTranscription.value = value.trim();
                 }
             }
             if (translateManualSegmentsToggle && translateManualSegmentsPanel) {
@@ -3501,6 +3638,9 @@ async def home():
                     }
                     if (typeof data.transcription === 'string') {
                         promptTemplates.transcription = data.transcription;
+                    }
+                    if (typeof data.ignore_non_speech_instruction === 'string') {
+                        promptTemplates.ignoreNonSpeech = data.ignore_non_speech_instruction;
                     }
                     refreshPromptTemplates();
                 } catch (error) {
@@ -3703,7 +3843,7 @@ async def home():
                     <div class="segment-card">
                         <div class="segment-header">🎼 Instrumental Backing Preview</div>
                         <audio controls style="width: 100%; margin-top: 6px;">
-                            <source src="${previewUrl}?session=${sessionId}&t=${cacheKey}" type="audio/wav">
+                            <source src="${previewUrl}?session=${sessionId}&t=${cacheKey}" type="audio/mpeg">
                         </audio>
                     </div>
                 `;
@@ -3794,6 +3934,8 @@ async def home():
                         formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                         formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
+                        formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
+                        formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
                         if (translateGeminiModel && translateGeminiModel.value) {
                             formData.append('gemini_model', translateGeminiModel.value);
                         }
@@ -3853,6 +3995,15 @@ async def home():
                             if (data.metadata && data.metadata.gemini_model && translateGeminiModel) {
                                 translateGeminiModel.value = data.metadata.gemini_model;
                             }
+                            if (translateIgnoreNonSpeechEl && data.metadata && typeof data.metadata.ignore_non_speech === 'boolean') {
+                                translateIgnoreNonSpeechEl.checked = !!data.metadata.ignore_non_speech;
+                                refreshPromptTemplates();
+                                syncPreserveSilenceState();
+                            }
+                            if (translatePreserveSilenceEl && data.metadata && typeof data.metadata.preserve_silence_audio === 'boolean') {
+                                translatePreserveSilenceEl.checked = !!data.metadata.preserve_silence_audio;
+                                syncPreserveSilenceState();
+                            }
                             renderBackingPreview(currentTranslateSessionId, data.metadata || null);
                             if (data.metadata && data.metadata.segment_rules) {
                                 syncSegmentRulesFromMetadata(data.metadata.segment_rules);
@@ -3901,6 +4052,8 @@ async def home():
                     formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                     formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
+                    formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
+                    formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
                     if (translateGeminiModel && translateGeminiModel.value) {
                         formData.append('gemini_model', translateGeminiModel.value);
                     }
@@ -3914,60 +4067,7 @@ async def home():
                         if (translateBtn) {
                             translateBtn.disabled = true;
                         }
-                        showStatus('Translating speech... this may take a moment ⏳', 'success', statusId);
-
-                        const response = await fetch('/api/translate_audio', {
-                            method: 'POST',
-                            body: formData
-                        });
-
-                        const contentType = response.headers.get('Content-Type') || '';
-
-                        if (!response.ok) {
-                            let errorMessage = `Translation failed (${response.status})`;
-                            if (contentType.includes('application/json')) {
-                                try {
-                                    const errorData = await response.json();
-                                    errorMessage = errorData.message || errorData.error || errorMessage;
-                                } catch (jsonError) {
-                                    console.warn('Failed to parse error response:', jsonError);
-                                }
-                            }
-                            showStatus(errorMessage, 'error', statusId);
-                            return;
-                        }
-
-                        if (contentType.startsWith('audio/')) {
-                            const blob = await response.blob();
-                            const audioUrl = URL.createObjectURL(blob);
-                            const downloadName = `translated_speech.${selectedFormat}`;
-
-                            resultDiv.innerHTML = `
-                                <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
-                                <div style="margin-top: 12px;">
-                                    <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
-                                </div>
-                            `;
-
-                            const segmentCount = response.headers.get('X-Translation-Segments');
-                            const modelHeader = response.headers.get('X-Translation-Model');
-                            let statusMessage = '✅ Translation complete!';
-                            if (segmentCount) {
-                                statusMessage += ` (${segmentCount} segments)`;
-                            }
-                            if (modelHeader) {
-                                statusMessage += ` • Gemini model: ${modelHeader}`;
-                            }
-                            showStatus(statusMessage, 'success', statusId);
-                        } else {
-                            try {
-                                const data = await response.json();
-                                const message = data.message || data.error || 'Translation failed.';
-                                showStatus(message, 'error', statusId);
-                            } catch (parseError) {
-                                showStatus('Translation failed: unexpected response format.', 'error', statusId);
-                            }
-                        }
+                        await streamDirectTranslate(formData, selectedFormat, statusId, resultDiv);
                     } catch (error) {
                         console.error('Translation error:', error);
                         showStatus(`Translation error: ${error.message}`, 'error', statusId);
@@ -4152,6 +4252,119 @@ async def home():
                         translateGenerateBtn.disabled = false;
                     }
                 });
+            }
+
+            async function streamDirectTranslate(formData, selectedFormat, statusId, resultDiv) {
+                showStatus('Translating speech... this may take a moment ⏳', 'success', statusId);
+
+                const response = await fetch('/api/translate_audio', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    let errorMessage = `Translation failed (${response.status})`;
+                    const contentType = response.headers.get('Content-Type') || '';
+                    if (contentType.includes('application/json')) {
+                        try {
+                            const errorData = await response.json();
+                            errorMessage = errorData.message || errorData.error || errorMessage;
+                        } catch (jsonError) {
+                            console.warn('Failed to parse error response:', jsonError);
+                        }
+                    } else {
+                        try {
+                            errorMessage = await response.text();
+                        } catch (textError) {
+                            console.warn('Failed to read error response:', textError);
+                        }
+                    }
+                    showStatus(errorMessage, 'error', statusId);
+                    return;
+                }
+
+                if (!response.body) {
+                    showStatus('Streaming is not supported in this browser.', 'error', statusId);
+                    return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                const newlineDelimiter = String.fromCharCode(10);
+                let buffer = '';
+                let translationCompleted = false;
+                let lastStatusMessage = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += decoder.decode(value, { stream: true });
+
+                    let newlineIndex = buffer.indexOf(newlineDelimiter);
+                    while (newlineIndex !== -1) {
+                        const line = buffer.slice(0, newlineIndex).trim();
+                        buffer = buffer.slice(newlineIndex + 1);
+                        newlineIndex = buffer.indexOf(newlineDelimiter);
+
+                        if (!line) {
+                            continue;
+                        }
+
+                        let eventData;
+                        try {
+                            eventData = JSON.parse(line);
+                        } catch (parseError) {
+                            console.warn('Failed to parse translate event:', parseError, line);
+                            continue;
+                        }
+
+                        const eventType = eventData.event || 'status';
+                        if (eventType === 'status') {
+                            const message = eventData.message || 'Processing...';
+                            lastStatusMessage = message;
+                            showStatus(message, 'success', statusId);
+                        } else if (eventType === 'heartbeat') {
+                            const heartbeatMessage = lastStatusMessage
+                                ? `Still processing... ⏳ (Last step: ${lastStatusMessage})`
+                                : 'Still processing... ⏳';
+                            showStatus(heartbeatMessage, 'success', statusId);
+                        } else if (eventType === 'error') {
+                            const message = eventData.message || 'Translation failed.';
+                            showStatus(message, 'error', statusId);
+                            return;
+                        } else if (eventType === 'complete') {
+                            translationCompleted = true;
+                            const audioUrl = eventData.audio_url;
+                            if (!audioUrl) {
+                                showStatus('Translation succeeded but audio URL is missing.', 'error', statusId);
+                                return;
+                            }
+                            const downloadName = eventData.file_name || `translated_speech.${selectedFormat}`;
+                            resultDiv.innerHTML = `
+                                <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
+                                <div style="margin-top: 12px;">
+                                    <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
+                                </div>
+                            `;
+
+                            let statusMessage = '✅ Translation complete!';
+                            const metadata = eventData.metadata || {};
+                            if (typeof metadata.segment_count === 'number') {
+                                statusMessage += ` (${metadata.segment_count} segments)`;
+                            }
+                            if (metadata.gemini_model) {
+                                statusMessage += ` • Gemini model: ${metadata.gemini_model}`;
+                            }
+                            showStatus(statusMessage, 'success', statusId);
+                        }
+                    }
+                }
+
+                if (!translationCompleted) {
+                    showStatus('Translation stream ended unexpectedly.', 'error', statusId);
+                }
             }
 
             async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
@@ -4608,6 +4821,7 @@ async def api_prompt_templates():
     return {
         "translation": TRANSLATION_PROMPT_TEMPLATE,
         "transcription": TRANSCRIPTION_PROMPT_TEMPLATE,
+        "ignore_non_speech_instruction": IGNORE_NON_SPEECH_PROMPT_SUFFIX,
     }
 
 
@@ -4629,6 +4843,8 @@ async def api_translate_segments(
     min_speech_ms: Optional[int] = Form(None),
     max_merge_ms: Optional[int] = Form(None),
     segments_json: Optional[str] = Form(None),
+    ignore_non_speech: Optional[bool] = Form(False),
+    preserve_silence_audio: Optional[bool] = Form(False),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
@@ -4649,17 +4865,9 @@ async def api_translate_segments(
         min_speech_duration_value = min_speech_ms
         max_merge_interval_value = max_merge_ms
         segments_override_value = segments_json
-        min_speech_duration_value = min_speech_ms
-        max_merge_interval_value = max_merge_ms
-        segments_override_value = segments_json
-        min_speech_duration_value = min_speech_ms
-        max_merge_interval_value = max_merge_ms
-        merge_backing_track_value = merge_backing_track
-        min_speech_duration_value = min_speech_ms
-        max_merge_interval_value = max_merge_ms
-        merge_backing_track_value = merge_backing_track
-        merge_backing_track_value = merge_backing_track
-        merge_backing_track_value = merge_backing_track
+        ignore_non_speech_value = ignore_non_speech
+        preserve_silence_audio_value = preserve_silence_audio
+        preserve_silence_audio_value = preserve_silence_audio
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -4692,6 +4900,8 @@ async def api_translate_segments(
             min_speech_duration_value = payload.get("min_speech_ms", min_speech_duration_value)
             max_merge_interval_value = payload.get("max_merge_ms", max_merge_interval_value)
             segments_override_value = payload.get("segments_json", segments_override_value)
+            ignore_non_speech_value = payload.get("ignore_non_speech", ignore_non_speech_value)
+            preserve_silence_audio_value = payload.get("preserve_silence_audio", preserve_silence_audio_value)
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -4713,6 +4923,8 @@ async def api_translate_segments(
 
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
+        ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
+        preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
         requested_merge_backing = _coerce_to_bool(merge_backing_track_value)
@@ -4828,19 +5040,34 @@ async def api_translate_segments(
                         pass
 
         with BytesIO() as processed_buffer:
-            original_audio.export(processed_buffer, format="wav")
+            original_audio.export(processed_buffer, format="mp3", bitrate="128k")
             processed_audio_bytes = processed_buffer.getvalue()
-        gemini_mime_type = "audio/wav"
+        gemini_mime_type = "audio/mpeg"
         merge_with_backing = requested_merge_backing and backing_track_audio is not None
         if requested_merge_backing and backing_track_audio is None:
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
 
+        non_speech_instruction_text = f"{IGNORE_NON_SPEECH_PROMPT_SUFFIX} " if ignore_non_speech_flag else ""
         final_prompt = (prompt_override or "").strip()
         if not final_prompt:
             if translate_enabled:
-                final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
+                final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(
+                    dest_language=dest_language_value,
+                    non_speech_instruction=non_speech_instruction_text,
+                )
             else:
-                final_prompt = TRANSCRIPTION_PROMPT_TEMPLATE
+                final_prompt = TRANSCRIPTION_PROMPT_TEMPLATE.format(
+                    non_speech_instruction=non_speech_instruction_text,
+                )
+            final_prompt = final_prompt.strip()
+        else:
+            placeholder_present = NON_SPEECH_PROMPT_PLACEHOLDER in final_prompt
+            final_prompt = final_prompt.replace(
+                NON_SPEECH_PROMPT_PLACEHOLDER,
+                non_speech_instruction_text,
+            ).strip()
+            if ignore_non_speech_flag and not placeholder_present:
+                final_prompt = f"{final_prompt.rstrip()} {IGNORE_NON_SPEECH_PROMPT_SUFFIX}".strip()
 
         manual_chunk_data = None
         manual_segments_used = False
@@ -4900,6 +5127,8 @@ async def api_translate_segments(
             gemini_api_key_value or None,
             backing_track_audio=backing_track_audio,
             merge_with_backing=merge_with_backing,
+            ignore_non_speech=ignore_non_speech_flag,
+            preserve_silence_audio=preserve_silence_audio_flag,
         )
         ui_segments = _serialize_segments_for_ui(segments, original_audio)
 
@@ -4914,6 +5143,8 @@ async def api_translate_segments(
             "bitrate": bitrate_value,
             "prompt": final_prompt,
             "gemini_model": resolved_gemini_model,
+            "ignore_non_speech": ignore_non_speech_flag,
+            "preserve_silence_audio": preserve_silence_audio_flag,
             "clearvoice": {
                 "enhancement": apply_enhancement,
                 "super_resolution": apply_super_resolution,
@@ -5062,9 +5293,12 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
             clearvoice_settings=session.clearvoice_settings,
             backing_track_audio=session.backing_track_audio,
             merge_with_backing=merge_with_backing,
+            preserve_silence_audio=session.preserve_silence_audio,
         )
 
         metadata.setdefault("backing_track", {})["requested"] = session.merge_with_backing
+        metadata["ignore_non_speech"] = session.ignore_non_speech
+        metadata["preserve_silence_audio"] = session.preserve_silence_audio
         generated_count = sum(
             1 for seg in final_segments if seg.get("type") == "speech" and not seg.get("keep_original", False)
         )
@@ -5135,7 +5369,7 @@ async def api_translate_backing_track(session_id: str):
 
     try:
         buffer = BytesIO()
-        session.backing_track_audio.export(buffer, format="wav")
+        session.backing_track_audio.export(buffer, format="mp3", bitrate="128k")
         audio_bytes = buffer.getvalue()
     except Exception as exc:
         return JSONResponse(
@@ -5144,10 +5378,36 @@ async def api_translate_backing_track(session_id: str):
         )
 
     headers = {
-        "Content-Disposition": f'inline; filename="translate_backing_{session_id}.wav"',
+        "Content-Disposition": f'inline; filename="translate_backing_{session_id}.mp3"',
         "Cache-Control": "no-store, no-cache",
     }
-    return Response(content=audio_bytes, media_type="audio/wav", headers=headers)
+    return Response(content=audio_bytes, media_type="audio/mpeg", headers=headers)
+
+
+@app.get("/api/translate_outputs/{filename}")
+async def api_translate_outputs(filename: str):
+    """Serve generated translate audio files by filename."""
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name != filename:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid filename."},
+        )
+
+    file_path = os.path.join(TRANSLATE_OUTPUT_DIR, safe_name)
+    if not os.path.exists(file_path):
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Requested audio not found."},
+        )
+
+    media_type = _guess_media_type_from_extension(safe_name)
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=safe_name,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/translate_audio")
@@ -5167,6 +5427,8 @@ async def api_translate_audio(
     min_speech_ms: Optional[int] = Form(None),
     max_merge_ms: Optional[int] = Form(None),
     segments_json: Optional[str] = Form(None),
+    ignore_non_speech: Optional[bool] = Form(False),
+    preserve_silence_audio: Optional[bool] = Form(False),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
@@ -5186,6 +5448,8 @@ async def api_translate_audio(
         min_speech_duration_value = min_speech_ms
         max_merge_interval_value = max_merge_ms
         segments_override_value = segments_json
+        ignore_non_speech_value = ignore_non_speech
+        preserve_silence_audio_value = preserve_silence_audio
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -5234,11 +5498,13 @@ async def api_translate_audio(
             segments_override_value = (
                 translate_req.segments_json if translate_req.segments_json is not None else segments_override_value
             )
-            min_speech_duration_value = (
-                translate_req.min_speech_ms if translate_req.min_speech_ms is not None else min_speech_duration_value
+            ignore_non_speech_value = (
+                translate_req.ignore_non_speech if translate_req.ignore_non_speech is not None else ignore_non_speech_value
             )
-            max_merge_interval_value = (
-                translate_req.max_merge_ms if translate_req.max_merge_ms is not None else max_merge_interval_value
+            preserve_silence_audio_value = (
+                translate_req.preserve_silence_audio
+                if translate_req.preserve_silence_audio is not None
+                else preserve_silence_audio_value
             )
 
         dest_language_value = (dest_language_value or "").strip()
@@ -5260,6 +5526,8 @@ async def api_translate_audio(
             )
 
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
+        ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
+        preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
         requested_merge_backing = _coerce_to_bool(merge_backing_track_value)
@@ -5298,178 +5566,289 @@ async def api_translate_audio(
             )
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
-        audio_format = _guess_audio_format_from_mime(input_mime_type)
 
-        try:
-            audio_buffer = BytesIO(audio_bytes)
-            if audio_format:
-                original_audio = AudioSegment.from_file(audio_buffer, format=audio_format)
-            else:
-                original_audio = AudioSegment.from_file(audio_buffer)
-        except Exception as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
-            )
+        request_summary = {
+            "dest_language": dest_language_value,
+            "response_format": response_format_value,
+            "bitrate": bitrate_value,
+            "enhancement": apply_enhancement,
+            "super_resolution": apply_super_resolution,
+            "merge_backing": requested_merge_backing,
+            "ignore_non_speech": ignore_non_speech_flag,
+            "preserve_silence_audio": preserve_silence_audio_flag,
+        }
 
-        backing_track_audio: Optional[AudioSegment] = None
-        pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
+        async def translate_stream():
+            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
 
-        processed_paths: Set[str] = set()
-        if apply_enhancement or apply_super_resolution:
-            if ClearVoice is None:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "status": "error",
-                        "message": "ClearVoice package is required for enhancement or super-resolution.",
-                    },
-                )
+            async def emit(event_type: str, **payload: Any) -> None:
+                event = {
+                    "event": event_type,
+                    "timestamp": time.time(),
+                    **payload,
+                }
+                await queue.put(event)
 
-            temp_input_path = None
-            final_processed_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
-                    original_audio.export(tmp_input.name, format="wav")
-                    temp_input_path = tmp_input.name
-                processed_paths.add(temp_input_path)
+            async def heartbeat_task():
+                try:
+                    while True:
+                        await asyncio.sleep(10)
+                        await emit("heartbeat", message="Still processing translation...")
+                except asyncio.CancelledError:
+                    pass
 
-                final_processed_path, clearvoice_paths, enhancement_output_path = await apply_clearvoice_processing(
-                    temp_input_path,
-                    apply_enhancement,
-                    apply_super_resolution,
-                )
-                processed_paths.update(clearvoice_paths)
-                processed_paths.add(final_processed_path)
+            async def run_pipeline():
+                heartbeat = asyncio.create_task(heartbeat_task())
+                try:
+                    await emit("status", stage="start", message="Translate request accepted.", summary=request_summary)
 
-                original_audio = AudioSegment.from_file(final_processed_path, format="wav")
-                enhancement_audio = None
-                if apply_enhancement:
-                    enhancement_source = enhancement_output_path or final_processed_path
+                    audio_format = _guess_audio_format_from_mime(input_mime_type)
                     try:
-                        enhancement_audio = AudioSegment.from_file(enhancement_source, format="wav")
-                    except Exception as enhancement_load_error:
-                        print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
-                if apply_enhancement and pre_clearvoice_mix_audio is not None:
-                    backing_track_audio = _extract_backing_track_from_vocals(
-                        pre_clearvoice_mix_audio,
-                        enhancement_audio or original_audio,
+                        audio_buffer = BytesIO(audio_bytes)
+                        if audio_format:
+                            original_audio = AudioSegment.from_file(audio_buffer, format=audio_format)
+                        else:
+                            original_audio = AudioSegment.from_file(audio_buffer)
+                    except Exception as exc:
+                        raise TranslateWorkflowHttpError(
+                            400,
+                            {"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
+                        ) from exc
+
+                    await emit(
+                        "status",
+                        stage="decode",
+                        message=f"Decoded audio ({len(original_audio) / 1000:.1f}s).",
                     )
-                    if backing_track_audio is not None:
-                        print("🎶 Extracted instrumental backing track via MossFormer2_SE_48K (direct translate).")
-            except Exception as cv_error:
-                for path in processed_paths:
+
+                    backing_track_audio: Optional[AudioSegment] = None
+                    pre_clearvoice_mix_audio: Optional[AudioSegment] = original_audio if apply_enhancement else None
+
+                    processed_paths: Set[str] = set()
+                    if apply_enhancement or apply_super_resolution:
+                        if ClearVoice is None:
+                            raise TranslateWorkflowHttpError(
+                                500,
+                                {
+                                    "status": "error",
+                                    "message": "ClearVoice package is required for enhancement or super-resolution.",
+                                },
+                            )
+
+                        await emit("status", stage="enhancement", message="Applying MossFormer2_SE_48K enhancement...")
+                        temp_input_path = None
+                        final_processed_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
+                                original_audio.export(tmp_input.name, format="wav")
+                                temp_input_path = tmp_input.name
+                            processed_paths.add(temp_input_path)
+
+                            (
+                                final_processed_path,
+                                clearvoice_paths,
+                                enhancement_output_path,
+                            ) = await apply_clearvoice_processing(
+                                temp_input_path,
+                                apply_enhancement,
+                                apply_super_resolution,
+                            )
+                            processed_paths.update(clearvoice_paths)
+                            processed_paths.add(final_processed_path)
+
+                            original_audio = AudioSegment.from_file(final_processed_path, format="wav")
+                            enhancement_audio = None
+                            if apply_enhancement:
+                                enhancement_source = enhancement_output_path or final_processed_path
+                                try:
+                                    enhancement_audio = AudioSegment.from_file(enhancement_source, format="wav")
+                                except Exception as enhancement_load_error:
+                                    print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
+                            if apply_enhancement and pre_clearvoice_mix_audio is not None:
+                                backing_track_audio = _extract_backing_track_from_vocals(
+                                    pre_clearvoice_mix_audio,
+                                    enhancement_audio or original_audio,
+                                )
+                                if backing_track_audio is not None:
+                                    print("🎶 Extracted instrumental backing track via MossFormer2_SE_48K (direct translate).")
+                        except Exception as cv_error:
+                            raise TranslateWorkflowHttpError(
+                                500,
+                                {"status": "error", "message": f"ClearVoice processing failed: {str(cv_error)}"},
+                            ) from cv_error
+                        finally:
+                            for path in processed_paths:
+                                try:
+                                    os.remove(path)
+                                except Exception:
+                                    pass
+                        await emit("status", stage="enhancement", message="ClearVoice enhancement complete.")
+
+                    with BytesIO() as processed_buffer:
+                        original_audio.export(processed_buffer, format="mp3", bitrate="128k")
+                        processed_audio_bytes = processed_buffer.getvalue()
+                    gemini_mime_type = "audio/mpeg"
+                    merge_with_backing = requested_merge_backing and backing_track_audio is not None
+                    if requested_merge_backing and backing_track_audio is None:
+                        print("⚠️ Unable to merge with backing track because no instrumental was derived.")
+
+                    non_speech_instruction_text = f"{IGNORE_NON_SPEECH_PROMPT_SUFFIX} " if ignore_non_speech_flag else ""
+                    final_prompt = (prompt_override or "").strip()
+                    if not final_prompt:
+                        final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(
+                            dest_language=dest_language_value,
+                            non_speech_instruction=non_speech_instruction_text,
+                        ).strip()
+                    else:
+                        placeholder_present = NON_SPEECH_PROMPT_PLACEHOLDER in final_prompt
+                        final_prompt = final_prompt.replace(
+                            NON_SPEECH_PROMPT_PLACEHOLDER,
+                            non_speech_instruction_text,
+                        ).strip()
+                        if ignore_non_speech_flag and not placeholder_present:
+                            final_prompt = f"{final_prompt.rstrip()} {IGNORE_NON_SPEECH_PROMPT_SUFFIX}".strip()
+
+                    manual_chunk_data = None
+                    manual_segments_used = False
+                    if segments_override_value:
+                        try:
+                            manual_chunk_data = _parse_manual_segments_input(segments_override_value)
+                            manual_segments_used = True
+                        except ValueError as exc:
+                            raise TranslateWorkflowHttpError(
+                                400,
+                                {"status": "error", "message": str(exc)},
+                            ) from exc
+
+                    await emit(
+                        "status",
+                        stage="gemini",
+                        message=f"Analyzing audio with Gemini model '{resolved_gemini_model}'...",
+                    )
+                    if manual_chunk_data is not None:
+                        gemini_chunks = manual_chunk_data
+                    else:
+                        gemini_chunks = await _gemini_transcribe_translate(
+                            processed_audio_bytes,
+                            gemini_mime_type,
+                            dest_language_value,
+                            final_prompt,
+                            model_name=resolved_gemini_model,
+                            api_key_override=gemini_api_key_value or None,
+                        )
+                    await emit(
+                        "status",
+                        stage="segmentation",
+                        message=f"Received {len(gemini_chunks)} raw segments; preparing timeline...",
+                    )
+
+                    segments = _prepare_translation_segments(
+                        original_audio,
+                        gemini_chunks,
+                        dest_language_value,
+                        min_speech_duration_ms=min_speech_duration,
+                        max_merge_interval_ms=max_merge_interval,
+                    )
+
+                    await emit(
+                        "status",
+                        stage="synthesis",
+                        message=f"Synthesizing translated speech ({len(segments)} total segments)...",
+                    )
+
+                    audio_payload, media_type, metadata = await _synthesize_translated_audio(
+                        original_audio,
+                        segments,
+                        dest_language_value,
+                        response_format=response_format_value,
+                        bitrate=bitrate_value,
+                        input_mime_type=input_mime_type,
+                        clearvoice_settings={
+                            "enhancement": apply_enhancement,
+                            "super_resolution": apply_super_resolution,
+                        },
+                        backing_track_audio=backing_track_audio,
+                        merge_with_backing=merge_with_backing,
+                        preserve_silence_audio=preserve_silence_audio_flag,
+                    )
+                    metadata["ignore_non_speech"] = ignore_non_speech_flag
+                    metadata["preserve_silence_audio"] = preserve_silence_audio_flag
+                    metadata.setdefault("backing_track", {}).update(
+                        {
+                            "requested": requested_merge_backing,
+                            "available": backing_track_audio is not None,
+                            "merged": merge_with_backing,
+                        }
+                    )
+                    metadata["segment_rules"] = {
+                        "min_speech_ms": min_speech_duration,
+                        "max_merge_ms": max_merge_interval,
+                    }
+                    metadata["manual_segments"] = manual_segments_used
+                    metadata["gemini_model"] = resolved_gemini_model
+
+                    headers = {
+                        "X-Translation-Model": resolved_gemini_model,
+                        "X-Translation-Segments": str(metadata.get("segment_count", len(segments))),
+                        "X-Translation-Speech-Segments": str(metadata.get("speech_segment_count", 0)),
+                        "X-Translation-Silence-Segments": str(metadata.get("silence_segment_count", 0)),
+                        "X-Translation-Input-Mime": input_mime_type or "",
+                        "X-Translation-ClearVoice": (
+                            f"enhancement={str(apply_enhancement).lower()};super_resolution={str(apply_super_resolution).lower()}"
+                        ),
+                        "X-Translation-Backing": (
+                            f"available={str(bool(backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
+                        ),
+                    }
+
+                    output_filename = f"translate_{uuid.uuid4().hex}.{response_format_value}"
+                    output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+                    with open(output_path, "wb") as outfile:
+                        outfile.write(audio_payload)
+
+                    audio_url = f"/api/translate_outputs/{output_filename}"
+
+                    await emit(
+                        "complete",
+                        message="Translation complete.",
+                        audio_url=audio_url,
+                        media_type=media_type,
+                        headers=headers,
+                        metadata=metadata,
+                        file_name=output_filename,
+                    )
+
+                except TranslateWorkflowHttpError as http_error:
+                    await emit(
+                        "error",
+                        status_code=http_error.status_code,
+                        message=http_error.content.get("message") or "Translation failed.",
+                        details=http_error.content,
+                    )
+                except Exception as exc:
+                    traceback.print_exc()
+                    await emit(
+                        "error",
+                        status_code=500,
+                        message=f"Translation failed: {str(exc)}",
+                    )
+                finally:
+                    heartbeat.cancel()
                     try:
-                        os.remove(path)
-                    except Exception:
+                        await heartbeat
+                    except asyncio.CancelledError:
                         pass
-                return JSONResponse(
-                    status_code=500,
-                    content={"status": "error", "message": f"ClearVoice processing failed: {str(cv_error)}"},
-                )
-            finally:
-                for path in processed_paths:
-                    try:
-                        os.remove(path)
-                    except Exception:
-                        pass
+                    await queue.put(None)
 
-        with BytesIO() as processed_buffer:
-            original_audio.export(processed_buffer, format="wav")
-            processed_audio_bytes = processed_buffer.getvalue()
-        gemini_mime_type = "audio/wav"
-        merge_with_backing = requested_merge_backing and backing_track_audio is not None
-        if requested_merge_backing and backing_track_audio is None:
-            print("⚠️ Unable to merge with backing track because no instrumental was derived.")
+            asyncio.create_task(run_pipeline())
 
-        final_prompt = (prompt_override or "").strip()
-        if not final_prompt:
-            final_prompt = TRANSLATION_PROMPT_TEMPLATE.format(dest_language=dest_language_value)
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
 
-        manual_chunk_data = None
-        manual_segments_used = False
-        if segments_override_value:
-            try:
-                manual_chunk_data = _parse_manual_segments_input(segments_override_value)
-                manual_segments_used = True
-            except ValueError as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": str(exc)},
-                )
-        if manual_chunk_data is not None:
-            gemini_chunks = manual_chunk_data
-        else:
-            gemini_chunks = await _gemini_transcribe_translate(
-                processed_audio_bytes,
-                gemini_mime_type,
-                dest_language_value,
-                final_prompt,
-                model_name=resolved_gemini_model,
-                api_key_override=gemini_api_key_value or None,
-            )
-        segments = _prepare_translation_segments(
-            original_audio,
-            gemini_chunks,
-            dest_language_value,
-            min_speech_duration_ms=min_speech_duration,
-            max_merge_interval_ms=max_merge_interval,
-        )
-
-        audio_payload, media_type, metadata = await _synthesize_translated_audio(
-            original_audio,
-            segments,
-            dest_language_value,
-            response_format=response_format_value,
-            bitrate=bitrate_value,
-            input_mime_type=input_mime_type,
-            clearvoice_settings={
-                "enhancement": apply_enhancement,
-                "super_resolution": apply_super_resolution,
-            },
-            backing_track_audio=backing_track_audio,
-            merge_with_backing=merge_with_backing,
-        )
-
-        metadata.setdefault("backing_track", {}).update(
-            {
-                "requested": requested_merge_backing,
-                "available": backing_track_audio is not None,
-                "merged": merge_with_backing,
-            }
-        )
-        metadata["segment_rules"] = {
-            "min_speech_ms": min_speech_duration,
-            "max_merge_ms": max_merge_interval,
-        }
-        metadata["manual_segments"] = manual_segments_used
-        metadata["segment_rules"] = {
-            "min_speech_ms": min_speech_duration,
-            "max_merge_ms": max_merge_interval,
-        }
-        metadata["gemini_model"] = resolved_gemini_model
-
-        headers = {
-            "Content-Disposition": f"attachment; filename=translated_speech.{response_format_value}",
-            "X-Translation-Model": resolved_gemini_model,
-            "X-Translation-Segments": str(metadata.get("segment_count", len(segments))),
-            "X-Translation-Speech-Segments": str(metadata.get("speech_segment_count", 0)),
-            "X-Translation-Silence-Segments": str(metadata.get("silence_segment_count", 0)),
-            "X-Translation-Input-Mime": input_mime_type or "",
-            "X-Translation-ClearVoice": f"enhancement={str(apply_enhancement).lower()};super_resolution={str(apply_super_resolution).lower()}",
-        }
-        headers["X-Translation-Backing"] = (
-            f"available={str(bool(backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
-        )
-
-        print(
-            f"✅ Translation complete: {metadata.get('segment_count', len(segments))} segments "
-            f"({metadata.get('speech_segment_count', 0)} speech / {metadata.get('silence_segment_count', 0)} silence), "
-            f"dest_language={dest_language_value}, format={response_format_value}, input_mime={input_mime_type}, "
-            f"gemini_model={resolved_gemini_model}"
-        )
-
-        return Response(content=audio_payload, media_type=media_type, headers=headers)
+        return StreamingResponse(translate_stream(), media_type="application/json")
 
     except RuntimeError as runtime_error:
         return JSONResponse(
